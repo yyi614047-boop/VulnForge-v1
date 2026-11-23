@@ -8,7 +8,7 @@ from app.agents.planner import ReproductionPlan
 from app.agents.research import ResearchResult
 from app.targets.material import TargetMaterial
 from app.workflow import VulnForgeWorkflow
-from app.targets.vulhub.runtime import VulhubDockerRuntime
+from app.targets.vulhub.runtime import VulhubDockerRuntime, VulhubRuntimeError
 from app.verification.models import VerificationPolicy
 from app.verification.policy import build_verification_policy
 
@@ -81,9 +81,12 @@ class FakePlanner:
 class FakeExecution:
     def __init__(self, mode="success", *, session_capable=True):
         self.mode, self.session_capable, self.calls = mode, session_capable, 0
-    def run(self, *, plan, target, runtime_target, run_id, authorized,
-            authorization_callback, verification_expectations=()):
+    def run(self, *, plan, target, runtime_target=None, run_id, authorized,
+            target_resolver=None, authorization_callback, verification_expectations=(),
+            diagnostics_callback=None):
         self.calls += 1
+        if runtime_target is None:
+            runtime_target = target_resolver(80)
         module = "exploit/multi/http/example"
         policy = build_verification_policy(run_id=run_id, target_id=runtime_target.container_id,
                                            vulnerability_type=plan.vulnerability_type,
@@ -93,6 +96,7 @@ class FakeExecution:
         request = ExecutionAuthorizationRequest(run_id=run_id, target_id=runtime_target.container_id,
                                                 target_fingerprint="target-fp", plan_fingerprint="plan-fp",
                                                 module_name=module, module_fingerprint="module-fp",
+                                                configuration_fingerprint="config-fp", configuration_summary={},
                                                 verification_policy_id=policy.policy_id)
         grant = authorization_callback(request) if authorization_callback else None
         matched = grant is not None and grant.approved and all(
@@ -253,6 +257,8 @@ def test_docker_runtime_starts_isolated_project_and_restores_only_metasploit_net
         if argv[:3] == ["docker", "compose", "--project-name"]:
             if "ps" in argv:
                 output = target_id + "\n"
+        elif argv[:3] == ["docker", "container", "ls"]:
+            output = "msf\n"
         elif argv[:3] == ["docker", "network", "inspect"]:
             inspected_name = argv[3]
             inspected_id = network_id if inspected_name == network_name else original_ids[inspected_name]
@@ -262,6 +268,7 @@ def test_docker_runtime_starts_isolated_project_and_restores_only_metasploit_net
             identifier = argv[-1]
             if identifier in {"msf", msf_id}:
                 output = __import__("json").dumps([{"Id": msf_id,
+                    "Config": {"Image": VulhubDockerRuntime.METASPLOIT_IMAGE},
                     "State": {"Running": True}, "NetworkSettings": {"Networks": msf_state["networks"]}}])
             else:
                 output = __import__("json").dumps([{"Id": target_id, "State": {"Running": True},
@@ -280,10 +287,12 @@ def test_docker_runtime_starts_isolated_project_and_restores_only_metasploit_net
                 elif option == "--ip6": ipam["IPv6Address"] = value
             name = argv[connect_index]
             msf_state["networks"][name] = {"NetworkID": network_id if name == network_name else original_ids[name],
-                                             "Aliases": aliases, "IPAMConfig": ipam}
+                                             "Aliases": aliases, "IPAMConfig": ipam,
+                                             "IPAddress": "172.22.0.3" if name == network_name else ""}
         return type("Result", (), {"returncode": 0, "stdout": output, "stderr": ""})()
 
-    runtime = VulhubDockerRuntime(tmp_path / "workspace", metasploit_container="msf", runner=runner)
+    runtime = VulhubDockerRuntime(tmp_path / "workspace", metasploit_container="msf",
+                                  rpc_password="test-password", runner=runner)
     started = runtime.start(target=material, run_id="run1")
     assert started["project"] == "lab-run1"
     sanitized_path = Path(runtime._runs["run1"]["prefix"][runtime._runs["run1"]["prefix"].index("--file") + 1])
@@ -313,6 +322,27 @@ def test_authorization_callback_exception_is_denial(tmp_path):
     assert execution.calls == 1
 
 
+def test_docker_runtime_collects_target_logs_and_http_status(tmp_path):
+    material = __import__("app.targets.vulhub.loader", fromlist=["load_target"]).load_target(
+        setup_vulhub(tmp_path / "source"), CVE)
+    target_id = "e" * 64
+
+    def runner(argv, **kwargs):
+        output = ""
+        if argv[:3] == ["docker", "compose", "--project-name"] and "ps" in argv:
+            output = target_id + "\n"
+        return type("Result", (), {
+            "returncode": 0, "stdout": output,
+            "stderr": "[WARNING] Header is too large >8192\n[WARNING] badMessage: 413",
+        })()
+
+    runtime = VulhubDockerRuntime(tmp_path / "workspace", metasploit_container="msf", runner=runner)
+    runtime.start(target=material, run_id="run-diagnostics")
+    diagnostics = runtime.collect_target_logs(run_id="run-diagnostics", service="web")
+    assert diagnostics["http_status"] == 413
+    assert "Header is too large" in diagnostics["target_log_tail"]
+
+
 def test_docker_runtime_strips_host_port_publication(tmp_path):
     root = setup_vulhub(tmp_path / "source")
     compose = root / "struts" / CVE / "docker-compose.yml"
@@ -331,3 +361,64 @@ def test_docker_runtime_strips_host_port_publication(tmp_path):
     assert "ports" not in service
     assert service["expose"] == ["61616", "8161"]
     assert calls and str(sanitized_path) in calls[0] and str(compose) not in calls[0]
+
+
+def test_docker_runtime_normalizes_project_relative_short_bind_as_read_only(tmp_path):
+    root = setup_vulhub(tmp_path / "source")
+    environment = root / "struts" / CVE
+    (environment / "struts.xml").write_text("<struts/>", encoding="utf-8")
+    (environment / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: example/web:1\n    volumes:\n"
+        "      - ./struts.xml:/usr/local/tomcat/conf/struts.xml\n",
+        encoding="utf-8",
+    )
+    material = __import__("app.targets.vulhub.loader", fromlist=["load_target"]).load_target(root, CVE)
+
+    def runner(argv, **kwargs):
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    runtime = VulhubDockerRuntime(tmp_path / "workspace", metasploit_container="msf", runner=runner)
+    runtime.start(target=material, run_id="run-short-bind")
+    run = runtime._runs["run-short-bind"]
+    sanitized_path = Path(run["prefix"][run["prefix"].index("--file") + 1])
+    sanitized = __import__("yaml").safe_load(sanitized_path.read_text(encoding="utf-8"))
+    assert sanitized["services"]["web"]["volumes"] == [{
+        "type": "bind", "source": "./struts.xml",
+        "target": "/usr/local/tomcat/conf/struts.xml", "read_only": True,
+    }]
+
+
+def test_docker_runtime_rejects_unsafe_or_writable_short_bind_mounts(tmp_path):
+    root = setup_vulhub(tmp_path / "source")
+    environment = root / "struts" / CVE
+    (environment / "struts.xml").write_text("<struts/>", encoding="utf-8")
+    runtime = VulhubDockerRuntime(tmp_path / "workspace", metasploit_container="msf")
+    for declaration in (
+        "/tmp/struts.xml:/usr/local/tomcat/conf/struts.xml:ro",
+        "../outside.xml:/usr/local/tomcat/conf/struts.xml:ro",
+        "named-volume:/usr/local/tomcat/conf/struts.xml",
+        "./struts.xml:/usr/local/tomcat/conf/struts.xml:rw",
+    ):
+        (environment / "docker-compose.yml").write_text(
+            "services:\n  web:\n    image: example/web:1\n    volumes:\n"
+            f"      - {declaration}\n",
+            encoding="utf-8",
+        )
+        material = __import__("app.targets.vulhub.loader", fromlist=["load_target"]).load_target(root, CVE)
+        with pytest.raises(VulhubRuntimeError, match="bind mounts|Short bind mounts"):
+            runtime._validate_compose(material)
+
+
+def test_docker_runtime_live_progress_inherits_terminal_streams(tmp_path):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(kwargs)
+        return type("Result", (), {"returncode": 0, "stdout": None, "stderr": None})()
+
+    runtime = VulhubDockerRuntime(tmp_path / "workspace", metasploit_container="msf", runner=runner)
+    assert runtime._call(["docker", "compose", "up"], live_progress=True) == ""
+    assert calls == [{"text": True, "encoding": "utf-8", "errors": "replace",
+                      "timeout": runtime.timeout, "shell": False, "cwd": None}]
+    assert runtime._call(["docker", "compose", "ps"]) == ""
+    assert calls[1]["capture_output"] is True

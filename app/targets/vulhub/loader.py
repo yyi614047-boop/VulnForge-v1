@@ -2,6 +2,7 @@
 from hashlib import sha256
 from pathlib import Path
 import re
+import tomllib
 
 import yaml
 
@@ -23,6 +24,55 @@ def resolve_cve(root: Path, cve: str) -> Path:
         raise TargetError("Expected a CVE identifier such as CVE-2017-5638.")
 
     normalized_cve = cve.upper()
+    manifest = root / "environments.toml"
+    if manifest.is_file() and not manifest.is_symlink():
+        try:
+            with manifest.open("rb") as stream:
+                index = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise TargetError(f"Could not read Vulhub environments.toml: {exc}") from exc
+
+        candidates = []
+        for entry in index.get("environment", []):
+            if not isinstance(entry, dict):
+                continue
+            cves = entry.get("cve", [])
+            if isinstance(cves, str):
+                cves = [cves]
+            if not isinstance(cves, list) or normalized_cve not in {
+                str(value).upper() for value in cves
+            }:
+                continue
+
+            relative_path = entry.get("path")
+            if not isinstance(relative_path, str) or not relative_path.strip():
+                continue
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise TargetError(
+                    f"Unsafe environment path in Vulhub manifest for {normalized_cve}."
+                )
+            environment = root / relative
+            try:
+                resolved = environment.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_relative_to(root):
+                raise TargetError(
+                    f"Vulhub environment path escapes the configured root: {relative_path}"
+                )
+            compose_file = resolved / "docker-compose.yml"
+            if (resolved.is_dir() and compose_file.is_file()
+                    and not compose_file.is_symlink()):
+                candidates.append(resolved)
+
+        # Some CVEs have multiple Vulhub variants. Use the first usable entry in
+        # manifest order so a CVE-only CLI invocation remains deterministic.
+        if candidates:
+            return candidates[0]
+
+    # Keep support for local Vulhub forks that use CVE IDs as directory names
+    # but do not include environments.toml.
     matches = []
     for compose_file in root.glob("*/*/docker-compose.yml"):
         environment = compose_file.parent

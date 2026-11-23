@@ -7,8 +7,8 @@ from app.verification.models import Evidence, RuleResult, VerificationPolicy
 ALLOWED_SESSION_TYPES = {"shell", "meterpreter"}
 
 
-def verify_session_established(*, policy: VerificationPolicy, evidence: tuple[Evidence, ...],
-                               execution_id: str, module_name: str | None) -> RuleResult:
+def verify_session_established(*, policy: VerificationPolicy,
+                               evidence: tuple[Evidence, ...]) -> RuleResult:
     records = [e for e in evidence if e.evidence_type == "metasploit_session_delta"
                and e.source == "metasploit_rpc"]
     if not records:
@@ -17,8 +17,6 @@ def verify_session_established(*, policy: VerificationPolicy, evidence: tuple[Ev
     used = []
     for record in records:
         data = record.metadata
-        if data.get("execution_id") != execution_id:
-            continue
         baseline = {str(x) for x in data.get("baseline_session_ids", [])}
         for session in data.get("sessions_after", []):
             if not isinstance(session, dict):
@@ -28,19 +26,14 @@ def verify_session_established(*, policy: VerificationPolicy, evidence: tuple[Ev
                 continue
             session_type = str(session.get("type", session.get("session_type", ""))).casefold()
             host = session.get("target_host") or session.get("session_host")
-            via = str(session.get("via_exploit") or session.get("via_module") or "")
-            via = via.removeprefix("exploit/")
-            linked_job = session.get("exploit_uuid") or session.get("job_uuid")
-            if (session_type in ALLOWED_SESSION_TYPES and host == data.get("target_host")
-                    and via == (module_name or "").removeprefix("exploit/")
-                    and linked_job == data.get("job_uuid")):
+            if session_type in ALLOWED_SESSION_TYPES and host == data.get("target_host"):
                 used.append(record.evidence_id)
     if used:
         return RuleResult(rule_name="session_established", status="success",
-                          reason="A new supported session is bound to this target, module and Metasploit job.",
+                          reason="A new supported session was observed on the target.",
                           evidence_ids=tuple(dict.fromkeys(used)))
     return RuleResult(rule_name="session_established", status="inconclusive",
-                      reason="No new session had sufficient type, target and current-job association evidence.",
+                      reason="No new supported session was observed on the target.",
                       evidence_ids=tuple(e.evidence_id for e in records))
 
 

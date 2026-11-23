@@ -64,9 +64,9 @@ class VulnForgeWorkflow:
         vulhub = VulhubSettings.from_environment()
         settings = Settings.from_environment()
         runner_model = create_model(settings)
-        container = os.getenv("MSF_CONTAINER_NAME", "").strip()
+        container = os.getenv("MSF_CONTAINER_NAME", "vulnforge-metasploit").strip()
         if not container:
-            raise ConfigurationError("Set MSF_CONTAINER_NAME to an already-running Metasploit container")
+            container = "vulnforge-metasploit"
         workspace = Path(os.getenv("VULNFORGE_RUNS_ROOT", ".vulnforge-runs"))
         sink = event_sink or (lambda event: None)
         execution = ExecutionAgent(
@@ -78,7 +78,12 @@ class VulnForgeWorkflow:
         )
         return cls(
             target_root=vulhub.root,
-            target_runtime=VulhubDockerRuntime(workspace / "targets", metasploit_container=container),
+            target_runtime=VulhubDockerRuntime(
+                workspace / "targets", metasploit_container=container,
+                rpc_user=os.getenv("MSFRPC_USER", "msf"),
+                rpc_password=os.getenv("MSFRPC_PASS", ""),
+                rpc_port=int(os.getenv("MSFRPC_CONTAINER_PORT", "55553")),
+            ),
             document_agent=DocumentAgent.from_environment(),
             research_agent=ResearchAgent.from_environment(),
             planner_agent=PlannerAgent.from_environment(),
@@ -128,7 +133,10 @@ class VulnForgeWorkflow:
 
         def target_prepare(state):
             target = load_target(self.target_root, state["cve_id"])
+            self._event("target_selected", run_id=state["run_id"], cve_id=state["cve_id"],
+                        environment=str(target.environment))
             runtime_info = self.target_runtime.start(target=target, run_id=state["run_id"])
+            self.target_runtime.prepare_metasploit(run_id=state["run_id"])
             return {"target": target, "runtime_target": runtime_info, "status": "running"}
 
         def document(state):
@@ -138,12 +146,13 @@ class VulnForgeWorkflow:
         def research(state):
             result = self.research_agent.run(cve_id=state["cve_id"],
                                              document_markdown=state["document_markdown"],
-                                             target=state["target"])
+                                             target=state["target"], language=self.language)
             return {"research_result": result}
 
         def planner(state):
             plan = self.planner_agent.run(cve_id=state["cve_id"], research=state["research_result"],
-                                          target=state["target"], document_markdown=state["document_markdown"])
+                                          target=state["target"], document_markdown=state["document_markdown"],
+                                          language=self.language)
             if not plan.executable or plan.status != "ready":
                 status = "unsupported" if plan.status == "unsupported" else "plan_blocked"
                 return {"reproduction_plan": plan, "status": status,
@@ -153,15 +162,20 @@ class VulnForgeWorkflow:
         def execution(state):
             plan = state["reproduction_plan"]
             run_id = state["run_id"]
-            self.target_runtime.prepare_metasploit(run_id=run_id)
-            runtime_target = self.target_runtime.resolve_target(run_id=run_id, service=plan.target_service)
-            state_runtime = runtime_target.model_dump(mode="json")
+            runtime_state = {}
+
+            def resolve_target(port: int):
+                resolved = self.target_runtime.resolve_target(run_id=run_id, service=plan.target_service, port=port)
+                runtime_state["target"] = resolved
+                return resolved
 
             def authorize(request: ExecutionAuthorizationRequest):
+                runtime_target = runtime_state.get("target")
                 self._event("execution_authorization_requested", run_id=run_id,
                             target_id=request.target_id, module_name=request.module_name,
+                            configuration=request.configuration_summary,
                             verification_policy_id=request.verification_policy_id,
-                            runtime_target=runtime_target.model_dump(mode="json"),
+                            runtime_target=runtime_target.model_dump(mode="json") if runtime_target else {},
                             reproduction_plan=plan.model_dump(mode="json"))
                 callback = self._authorization_callback
                 try:
@@ -177,11 +191,21 @@ class VulnForgeWorkflow:
                                                  == request.model_dump()))
                 return grant
 
+            def collect_diagnostics():
+                collector = getattr(self.target_runtime, "collect_target_logs", None)
+                if collector is None:
+                    return {}
+                return collector(run_id=run_id, service=plan.target_service)
+
             result = self.execution_agent.run(
-                plan=plan, target=state["target"], runtime_target=runtime_target,
+                plan=plan, target=state["target"], target_resolver=resolve_target,
                 run_id=run_id, authorized=False, authorization_callback=authorize,
                 verification_expectations=self._verification_expectations,
+                diagnostics_callback=collect_diagnostics,
             )
+            runtime_target = runtime_state.get("target")
+            state_runtime = (runtime_target.model_dump(mode="json")
+                             if runtime_target else result.target)
             updates = {"runtime_target": state_runtime, "execution_result": result,
                        "verification_policy": result.verification_policy}
             if result.status == "unsupported":
@@ -195,18 +219,15 @@ class VulnForgeWorkflow:
                         "errors": list(result.errors)}
             return updates
 
-        def evidence(state):
+        def evidence_and_verify(state):
             bundle = self.evidence_collector.collect(state["execution_result"])
-            return {"evidence": bundle}
-
-        def verify(state):
             self._event("verification_started", run_id=state["run_id"],
                         policy_id=state["verification_policy"].policy_id)
             result = self.verification_engine.verify(policy=state["verification_policy"],
                                                       execution=state["execution_result"],
-                                                      evidence=state["evidence"])
+                                                      evidence=bundle)
             self._event("verification_completed", run_id=state["run_id"], status=result.status)
-            return {"verification_result": result, "status": result.status}
+            return {"evidence": bundle, "verification_result": result, "status": result.status}
 
         def cleanup(state):
             run_id = state["run_id"]
@@ -234,17 +255,15 @@ class VulnForgeWorkflow:
         graph.add_node("research", self._stage("research", research))
         graph.add_node("planner", self._stage("planner", planner))
         graph.add_node("execution", self._stage("execution", execution))
-        graph.add_node("evidence_collection", self._stage("evidence_collection", evidence))
-        graph.add_node("verification", self._stage("verification", verify))
+        graph.add_node("evidence_verification", self._stage("evidence_verification", evidence_and_verify))
         graph.add_node("resource_cleanup", cleanup)
         graph.add_edge(START, "target_preparation")
         graph.add_conditional_edges("target_preparation", lambda s: self._next(s, "document"))
         graph.add_conditional_edges("document", lambda s: self._next(s, "research"))
         graph.add_conditional_edges("research", lambda s: self._next(s, "planner"))
         graph.add_conditional_edges("planner", lambda s: self._next(s, "execution"))
-        graph.add_conditional_edges("execution", lambda s: self._next(s, "evidence_collection"))
-        graph.add_conditional_edges("evidence_collection", lambda s: self._next(s, "verification"))
-        graph.add_edge("verification", "resource_cleanup")
+        graph.add_conditional_edges("execution", lambda s: self._next(s, "evidence_verification"))
+        graph.add_edge("evidence_verification", "resource_cleanup")
         graph.add_edge("resource_cleanup", END)
         return graph.compile()
 
@@ -258,4 +277,4 @@ class VulnForgeWorkflow:
                                       "cve_id": cve_id.upper(), "status": "running", "errors": []}
             final = self.graph.invoke(initial)
             self._event("workflow_completed", run_id=final["run_id"], status=final.get("status", "failed"))
-            return final\n
+            return final

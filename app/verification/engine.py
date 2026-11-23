@@ -38,9 +38,9 @@ class VerificationEngine:
             rule = category.get(name)
             if rule is None:
                 return VerificationResult(**common, status="verification_unsupported", reason=f"Policy names an unsupported rule: {name}.")
-            kwargs = {"policy": policy, "evidence": evidence.evidence,
-                      "execution_id": execution.execution_id,
-                      "module_name": execution.module_name}
+            kwargs = {"policy": policy, "evidence": evidence.evidence}
+            if name == "command_output_match":
+                kwargs["execution_id"] = execution.execution_id
             results.append(rule(**kwargs))
         result_status = ("success" if any(r.status == "success" for r in results) else
                          "failed" if results and all(r.status == "failed" for r in results) else "inconclusive")

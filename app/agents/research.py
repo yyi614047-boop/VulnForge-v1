@@ -47,12 +47,19 @@ class ResearchResult(BaseModel):
 _INSTRUCTIONS = """Research the vulnerability using only the source material in the user message.
 Do not use remembered CVE details or infer facts from the CVE identifier alone. Do not search
 the web, fetch URLs, call external services, run tools, or probe targets. Separate facts stated
-by a source from analysis inferred from a quoted source excerpt. For every non-empty finding,
-provide an evidence entry with the exact source label and an exact quote from that source.
+by a source from analysis inferred from a quoted source excerpt. For every supported non-empty
+claim, fill the matching ResearchResult field and add a ResearchEvidence entry to the evidence list.
+Use only the defined ResearchResult fields. Do not add top-level fields such as findings,
+research_scope, or sources_used. Each evidence entry must use the matching field name, exact
+source label, and an exact quote from that source.
 Use basis 'explicit' only when the quote directly states the claim, otherwise use 'analysis'.
 If a detail is not supported, leave it null, use 'Unknown', or list it as a limitation. Preserve
 conflicts between sources and do not silently choose one version. Do not create a reproduction
-plan, select modules, define verification rules, or claim successful exploitation."""
+plan, select modules, define verification rules, or claim successful exploitation.
+Write for readers who may not know vulnerability jargon. Keep vulnerability_summary to one or two
+short sentences. Explain the mechanism in a few clear steps, briefly define specialized terms the
+first time they appear, and avoid repeating facts across summary, conditions, prerequisites and
+limitations. Keep each condition specific and concise."""
 
 
 class ResearchAgentError(ValueError):
@@ -68,31 +75,31 @@ class ResearchAgent:
         return cls(AgentRunner(create_model(Settings.from_environment())))
 
     def run(self, *, cve_id: str, document_markdown: str,
-            target: TargetMaterial | None = None) -> ResearchResult:
+            target: TargetMaterial | None = None, language: str = "zh") -> ResearchResult:
+        if language not in {"zh", "en"}:
+            raise ValueError("language must be 'zh' or 'en'.")
         if target is not None and target.identifier.casefold() != cve_id.casefold():
             raise ResearchAgentError("Research target identifier does not match cve_id.")
 
-        source_texts = self._source_texts(document_markdown, target)
         input_text = self._build_input(cve_id, document_markdown, target)
         try:
             result = self.runner.run(
                 agent_name="Research Agent",
-                instructions=_INSTRUCTIONS,
+                instructions=(
+                    _INSTRUCTIONS
+                    + (" Write all claim, summary, mechanism, condition, prerequisite and limitation text in Chinese."
+                       " Keep exact source quotes and source labels unchanged."
+                       if language == "zh" else
+                       " Write all natural-language fields in English. Keep exact source quotes and source labels unchanged.")
+                ),
                 input_text=input_text,
                 result_schema=ResearchResult,
             )
         except Exception as exc:
             raise ResearchAgentError(f"Research Agent model call failed: {exc}") from exc
-        return self._ground_result(result, cve_id, source_texts)
-
-    @staticmethod
-    def _source_texts(document_markdown: str,
-                      target: TargetMaterial | None) -> dict[str, str]:
-        sources = {"Document Agent Markdown": document_markdown} if document_markdown else {}
-        if target:
-            for source in target.supporting_sources:
-                sources[source.path.as_posix()] = source.content
-        return sources
+        if result.cve_id.casefold() != cve_id.casefold():
+            raise ResearchAgentError("Research result CVE does not match the requested CVE.")
+        return result
 
     @staticmethod
     def _build_input(cve_id: str, document_markdown: str,
@@ -131,63 +138,3 @@ class ResearchAgent:
         else:
             sections.append("No additional local target information was supplied.")
         return "\n\n".join(sections)
-
-    @staticmethod
-    def _ground_result(result: ResearchResult, cve_id: str,
-                       source_texts: dict[str, str]) -> ResearchResult:
-        valid_evidence = []
-        for item in result.evidence:
-            source = source_texts.get(item.source)
-            if source is None or not item.quote or item.quote not in source:
-                continue
-            if item.basis == "explicit" and item.claim.casefold() not in item.quote.casefold():
-                continue
-            valid_evidence.append(item)
-
-        supported_claims = {(item.field, item.claim) for item in valid_evidence}
-        unsupported_fields = set()
-
-        vulnerability_type = result.vulnerability_type
-        if vulnerability_type != "Unknown" and (
-            "vulnerability_type", vulnerability_type
-        ) not in supported_claims:
-            vulnerability_type = "Unknown"
-            unsupported_fields.add("vulnerability_type")
-
-        scalar_values = {}
-        for field in ("affected_component", "vulnerability_summary", "vulnerability_mechanism"):
-            value = getattr(result, field)
-            if value and (field, value) not in supported_claims:
-                scalar_values[field] = None
-                unsupported_fields.add(field)
-            else:
-                scalar_values[field] = value
-
-        list_values = {}
-        for field in ("trigger_conditions", "prerequisites", "limitations"):
-            original = getattr(result, field)
-            supported = [
-                claim for claim in original if (field, claim) in supported_claims
-            ]
-            if len(supported) != len(original):
-                unsupported_fields.add(field)
-            list_values[field] = supported
-
-        limitations = list(result.limitations)
-        if not source_texts.get("Document Agent Markdown", "").strip():
-            limitations.append("Document Agent Markdown was missing or empty.")
-        if not any(key != "Document Agent Markdown" for key in source_texts):
-            limitations.append("No additional local target information was supplied.")
-        for field in sorted(unsupported_fields):
-            note = f"Some {field.replace('_', ' ')} claims lacked a matching source quote and were omitted."
-            if note not in limitations:
-                limitations.append(note)
-
-        return result.model_copy(update={
-            "cve_id": cve_id,
-            "vulnerability_type": vulnerability_type,
-            **scalar_values,
-            **list_values,
-            "limitations": limitations,
-            "evidence": valid_evidence,
-        })

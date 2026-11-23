@@ -1,4 +1,6 @@
 """Create the shared chat model from explicit runtime settings."""
+import os
+
 from app.runtime.config import ConfigurationError, Settings
 
 
@@ -9,8 +11,8 @@ def create_model(settings: Settings):
     options = {
         "model": settings.model_name,
         "temperature": 0,
-        "timeout": 60,
-        "max_retries": 0,
+        "timeout": int(os.getenv("VULNFORGE_MODEL_TIMEOUT", "180")),
+        "max_retries": int(os.getenv("VULNFORGE_MODEL_MAX_RETRIES", "1")),
     }
     if settings.model_base_url:
         options["base_url"] = settings.model_base_url
