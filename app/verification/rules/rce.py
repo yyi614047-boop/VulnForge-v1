@@ -43,12 +43,12 @@ def verify_command_output_match(*, policy: VerificationPolicy, evidence: tuple[E
         return RuleResult(rule_name="command_output_match", status="inconclusive",
                           reason="No command output expectation was frozen before execution.")
     records = [e for e in evidence if e.evidence_type == "metasploit_command_output"
-               and e.source == "metasploit_rpc_command_output"
+               and e.source in {"metasploit_rpc_command_output", "script_command_output"}
                and e.metadata.get("execution_id") == execution_id
                and e.metadata.get("target_id") == policy.target_id]
     if not records:
         return RuleResult(rule_name="command_output_match", status="inconclusive",
-                          reason="No target-bound command output from the Metasploit execution was collected.")
+                          reason="No target-bound command output from the execution was collected.")
     matched_ids = []
     session_records = [item for item in evidence
                        if item.evidence_type == "metasploit_session_delta"
@@ -88,7 +88,7 @@ def verify_command_output_match(*, policy: VerificationPolicy, evidence: tuple[E
                 break
     if matched_ids:
         return RuleResult(rule_name="command_output_match", status="success",
-                          reason="Metasploit command output matched a pre-execution expectation.",
+                          reason="Target-bound command output matched a pre-execution expectation.",
                           evidence_ids=tuple(dict.fromkeys(matched_ids)))
     return RuleResult(rule_name="command_output_match", status="inconclusive",
                       reason="Collected command output did not match the frozen expectation.",

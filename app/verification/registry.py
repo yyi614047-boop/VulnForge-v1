@@ -4,8 +4,12 @@ from dataclasses import dataclass
 
 from app.verification.contracts import VerificationContract
 from app.verification.models import RuleResult
+from app.verification.rules.database_result import verify_database_result_observed
 from app.verification.rules.file_write import verify_file_artifact_observed
+from app.verification.rules.http_response import verify_http_response_observed
+from app.verification.rules.oob_callback import verify_oob_callback_observed
 from app.verification.rules.rce import verify_command_output_match, verify_session_established
+from app.verification.rules.state_change import verify_state_change_observed
 
 
 @dataclass(frozen=True)
@@ -39,10 +43,6 @@ class VulnerabilityTypeRegistry:
     @property
     def definitions(self) -> tuple[VulnerabilityTypeDefinition, ...]:
         return tuple(self._definitions.values())
-
-    def is_known(self, name: str) -> bool:
-        definition = self.get(name)
-        return definition is not None and definition.known
 
     def allowed_evidence_kinds(self, name: str) -> frozenset[str]:
         definition = self.get(name)
@@ -99,16 +99,16 @@ EVIDENCE_RULES = EvidenceRuleRegistry((
     EvidenceRuleDefinition("session", "session_established", verify_session_established, True),
     EvidenceRuleDefinition("command_output", "command_output_match", verify_command_output_match, True,
                            requires_execution_id=True),
-    EvidenceRuleDefinition("http_response", "http_response_observed", None, False,
-                           "No trusted HTTP response collector is implemented."),
-    EvidenceRuleDefinition("oob_callback", "oob_callback_observed", None, False,
-                           "No trusted out-of-band callback collector is implemented."),
+    EvidenceRuleDefinition("http_response", "http_response_observed", verify_http_response_observed,
+                           True, requires_execution_id=True),
+    EvidenceRuleDefinition("oob_callback", "oob_callback_observed", verify_oob_callback_observed,
+                           True, requires_execution_id=True),
     EvidenceRuleDefinition("file_artifact", "file_artifact_observed", verify_file_artifact_observed, True,
                            requires_execution_id=True),
-    EvidenceRuleDefinition("database_result", "database_result_observed", None, False,
-                           "No trusted database result collector is implemented."),
-    EvidenceRuleDefinition("state_change", "state_change_observed", None, False,
-                           "No trusted state-change collector is implemented."),
+    EvidenceRuleDefinition("database_result", "database_result_observed", verify_database_result_observed,
+                           True, requires_execution_id=True),
+    EvidenceRuleDefinition("state_change", "state_change_observed", verify_state_change_observed, True,
+                           requires_execution_id=True),
 ))
 
 
@@ -154,7 +154,3 @@ def validate_contract(*, vulnerability_type: str, contract: VerificationContract
 
 def copy_rule_registry(registry: EvidenceRuleRegistry = EVIDENCE_RULES) -> EvidenceRuleRegistry:
     return EvidenceRuleRegistry(registry.definitions)
-
-
-def copy_type_registry(registry: VulnerabilityTypeRegistry = VULNERABILITY_TYPES) -> VulnerabilityTypeRegistry:
-    return VulnerabilityTypeRegistry(registry.definitions)

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+from app.cli import CliArgumentParser, requested_language
 from app.runtime.config import ConfigurationError
 from app.targets.vulhub.config import VulhubSettings
 from app.targets.vulhub.loader import TargetError, resolve_cve
@@ -152,26 +153,36 @@ def _positive_int(value: str) -> int:
     return number
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def build_parser(lang="zh") -> argparse.ArgumentParser:
+    zh = lang == "zh"
+    parser = CliArgumentParser(
         prog="vulnforge-batch-rce",
-        description="Run local Vulhub RCE CVEs sequentially with per-target authorization.",
+        description=("逐个授权并按顺序运行本地 Vulhub RCE CVE。" if zh else
+                    "Run local Vulhub RCE CVEs sequentially with per-target authorization."),
+        lang=lang,
     )
-    parser.add_argument("--vulhub-root", type=Path)
+    parser.add_argument("--vulhub-root", type=Path,
+                        help="本地 Vulhub 根目录。" if zh else "Local Vulhub root.")
     parser.add_argument("--cve", action="append", dest="cves", default=[],
-                        help="Run only this CVE; may be repeated.")
+                        help="仅运行指定 CVE，可重复传入。" if zh else "Run only this CVE; may be repeated.")
     parser.add_argument("--limit", type=_positive_int,
-                        help="Run only the first N selected CVEs.")
-    parser.add_argument("--lang", choices=("zh", "en"), default="zh")
+                        help="仅运行选中的前 N 个 CVE。" if zh else "Run only the first N selected CVEs.")
+    parser.add_argument("--lang", choices=("zh", "en"), default="zh",
+                        help="输出语言，默认中文。" if zh else "Output language (default: Chinese).")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="List selected CVEs without running them (default).")
-    mode.add_argument("--execute", action="store_true", help="Execute after interactive authorization for each target.")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="仅列出选中的 CVE，不执行（默认）。" if zh else "List selected CVEs without running them (default).")
+    mode.add_argument("--execute", action="store_true",
+                      help="逐个交互式授权后执行。" if zh else "Execute after interactive authorization for each target.")
     parser.add_argument("--batch-dir", type=Path,
-                        help="Artifact directory for this batch; defaults under the runs root.")
+                        help="本次批处理产物目录，默认位于 runs 根目录下。" if zh else
+                             "Artifact directory for this batch; defaults under the runs root.")
     parser.add_argument("--stop-on-error", action="store_true",
-                        help="Stop on the first failed run instead of continuing.")
+                        help="首个目标运行失败后停止，而不是继续。" if zh else
+                             "Stop on the first failed run instead of continuing.")
     parser.add_argument("--timeout", type=_positive_int,
-                        help="Optional timeout in seconds for each single-CVE run.")
+                        help="每个 CVE 单次运行的可选超时秒数。" if zh else
+                             "Optional timeout in seconds for each single-CVE run.")
     return parser
 
 
@@ -275,18 +286,37 @@ def _write_summary(batch_dir: Path, payload: dict) -> None:
             })
 
 
-def _print_discovery(selected: Sequence[RceTarget]) -> None:
-    print(f"Selected RCE CVEs: {len(selected)}")
+def _text(lang, zh, en):
+    return zh if lang == "zh" else en
+
+
+def _display_status(value, lang):
+    if lang == "en":
+        return value
+    return {
+        "success": "成功", "failed": "失败", "completed": "已完成",
+        "cancelled": "已取消", "execution_unauthorized": "未获得执行授权",
+        "execution_failed": "执行失败", "plan_blocked": "复现计划未通过",
+        "inconclusive": "证据不足", "verification_unsupported": "暂不支持自动验证",
+        "disabled": "已禁用", "unsupported": "暂不支持", "timeout": "超时", "launch_failed": "启动失败",
+        "artifact_missing": "缺少产物", "artifact_invalid": "产物无效",
+        "config_error": "配置错误", "process_failed": "进程异常",
+    }.get(value, value)
+
+
+def _print_discovery(selected: Sequence[RceTarget], lang="zh") -> None:
+    print(_text(lang, f"已选择 {len(selected)} 个 RCE CVE。", f"Selected RCE CVEs: {len(selected)}"))
     for target in selected:
         print(f"  {target.cve}\t{target.app}\t{target.source_path}")
 
 
 def main(argv: Sequence[str] | None = None, *,
          runner: Callable[..., subprocess.CompletedProcess] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser(requested_language(arguments)).parse_args(arguments)
     invalid = [cve for cve in args.cves if not CVE_RE.fullmatch(cve)]
     if invalid:
-        print("Invalid CVE identifier: " + ", ".join(invalid), file=sys.stderr)
+        print(_text(args.lang, "CVE 编号格式无效：", "Invalid CVE identifier: ") + ", ".join(invalid), file=sys.stderr)
         return 2
     try:
         root = (args.vulhub_root.expanduser().resolve() if args.vulhub_root
@@ -297,20 +327,18 @@ def main(argv: Sequence[str] | None = None, *,
         return 2
 
     selected = list(discovery.selected[:args.limit] if args.limit else discovery.selected)
-    _print_discovery(selected)
+    _print_discovery(selected, args.lang)
     if args.cves and not discovery.selected:
-        print("None of the requested CVEs is a runnable RCE manifest variant.", file=sys.stderr)
+        print(_text(args.lang, "指定的 CVE 均不是可运行的 RCE 清单条目。",
+                    "None of the requested CVEs is a runnable RCE manifest variant."), file=sys.stderr)
         return 2
     if not args.execute:
-        print("Dry run only. Re-run with --execute to authorize and run each target.")
+        print(_text(args.lang, "当前仅预演，未执行。添加 --execute 可逐个授权并运行目标。",
+                    "Dry run only. Re-run with --execute to authorize and run each target."))
         return 0
     if not selected:
-        print("No runnable RCE CVEs selected.")
+        print(_text(args.lang, "未选中可运行的 RCE CVE。", "No runnable RCE CVEs selected."))
         return 0
-    if not sys.stdin.isatty():
-        print("Batch execution requires an interactive terminal for per-target authorization.",
-              file=sys.stderr)
-        return 2
 
     if args.batch_dir:
         batch_dir = args.batch_dir.expanduser().resolve()
@@ -319,14 +347,16 @@ def main(argv: Sequence[str] | None = None, *,
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         batch_dir = runs_root / "rce-batches" / f"{stamp}_{uuid.uuid4().hex[:8]}"
     if batch_dir.is_relative_to(root):
-        print("Batch artifacts must be outside the read-only Vulhub root.", file=sys.stderr)
+        print(_text(args.lang, "批量产物必须位于只读 Vulhub 根目录之外。",
+                    "Batch artifacts must be outside the read-only Vulhub root."), file=sys.stderr)
         return 2
     try:
         batch_dir.mkdir(parents=True, exist_ok=False)
         child_runs_root = batch_dir / "runs"
         child_runs_root.mkdir()
     except OSError as exc:
-        print(f"Could not create batch artifact directory: {exc}", file=sys.stderr)
+        print(_text(args.lang, "无法创建批量产物目录：", "Could not create batch artifact directory: ") + str(exc),
+              file=sys.stderr)
         return 2
     batch_id = batch_dir.name
     child_env = os.environ.copy()
@@ -382,7 +412,7 @@ def main(argv: Sequence[str] | None = None, *,
             "app": target.app,
             "environment": target.source_path,
             "status": status,
-            "verification_status": verification.get("status") if isinstance(verification, dict) else None,
+            "verification_status": verification.get("status") if isinstance(verification, dict) and verification else "disabled",
             "exit_code": exit_code,
             "run_id": (result or {}).get("run_id"),
             "started_at": started.isoformat(),
@@ -394,7 +424,10 @@ def main(argv: Sequence[str] | None = None, *,
         }
         results.append(record)
         persist()
-        print(f"Result: {status} | verification: {record['verification_status'] or 'unknown'}")
+        verification_status = record["verification_status"] or "unknown"
+        print(_text(args.lang, "结果：", "Result: ") + _display_status(status, args.lang)
+              + _text(args.lang, " | 验证：", " | verification: ")
+              + _display_status(verification_status, args.lang))
         if stopped_reason == "user_cancelled":
             break
         if status in {"cancelled", "execution_unauthorized"}:
@@ -411,10 +444,12 @@ def main(argv: Sequence[str] | None = None, *,
         batch_id=batch_id, root=root, batch_dir=batch_dir, selected=selected,
         skipped=discovery.skipped, results=results, stopped_reason=stopped_reason,
     )
-    print(f"\nCompleted: {len(results)}/{len(selected)}")
-    print("Status counts: " + json.dumps(payload["status_counts"], ensure_ascii=False))
-    print(f"Batch summary: {(batch_dir / 'summary.json').resolve()}")
-    print(f"Batch CSV: {(batch_dir / 'summary.csv').resolve()}")
+    print("\n" + _text(args.lang, f"已完成：{len(results)}/{len(selected)}",
+                        f"Completed: {len(results)}/{len(selected)}"))
+    print(_text(args.lang, "状态统计：", "Status counts: ")
+          + json.dumps(payload["status_counts"], ensure_ascii=False))
+    print(_text(args.lang, "批量摘要：", "Batch summary: ") + str((batch_dir / "summary.json").resolve()))
+    print(_text(args.lang, "批量 CSV：", "Batch CSV: ") + str((batch_dir / "summary.csv").resolve()))
     if stopped_reason == "user_cancelled":
         return 130
     return 1 if any(

@@ -44,9 +44,9 @@ class VerificationEngine:
         if policy.policy_id != compute_policy_id(policy):
             return VerificationResult(**common, status="failed",
                                       reason="Verification policy fingerprint does not match its frozen contents.")
-        if execution.status in {"failed", "rejected"}:
+        if execution.status == "rejected":
             return VerificationResult(**common, status="failed", evidence_ids=all_evidence_ids,
-                                      reason="Execution has an explicit failure or rejection status.")
+                                      reason="Execution has an explicit rejection status.")
         if execution.status == "unsupported":
             return VerificationResult(**common, status="verification_unsupported",
                                       evidence_ids=all_evidence_ids,

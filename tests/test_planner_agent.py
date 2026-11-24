@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.agents.planner import PlannerAgent, PlannerAgentError
-from app.agents.research import ResearchObservation, ResearchResult
+from app.agents.research import ResearchDatabaseProbe, ResearchHttpProbe, ResearchObservation, ResearchResult
 from app.agents.runner import AgentRunner
 from app.targets.material import TargetMaterial
 
@@ -141,11 +141,11 @@ def test_rce_plan_uses_only_implemented_evidence_rules(research, target, draft):
         "command_output",
     ]
     prompt = model.calls[0][1][1]
-    assert "oob_callback" not in prompt
+    assert "oob_callback" in prompt
     assert "The exploit tool logged delivery." not in prompt
 
 
-def test_planner_rejects_unimplemented_evidence_selection(research, target, draft):
+def test_planner_freezes_random_oob_token_without_blocking_execution(research, target, draft):
     research.observations.insert(0, ResearchObservation(
         effect="An out-of-band callback is observed", evidence_kind="oob_callback",
         summary="The callback is visible.", source="local README",
@@ -154,9 +154,12 @@ def test_planner_rejects_unimplemented_evidence_selection(research, target, draf
     draft["observation_indices"] = [0]
     result, _ = plan(research, target, draft)
 
-    assert result.status == "blocked"
-    assert not result.executable
-    assert any("没有已实现的自动验证规则" in error for error in result.validation_errors)
+    assert result.status == "ready"
+    assert result.executable
+    assert result.automatic_verification_supported
+    expectation = result.verification_contract.oob_expectations[0]
+    assert expectation.path == f"/oob/{expectation.token}"
+    assert len(expectation.token) >= 16
 
 
 def test_planner_excludes_implemented_evidence_disallowed_by_type(research, target, draft):
@@ -177,8 +180,9 @@ def test_planner_excludes_implemented_evidence_disallowed_by_type(research, targ
     draft["observation_indices"] = [1]
     result, model = plan(research, target, draft)
 
-    assert result.status == "unsupported"
-    assert result.target_service == "web"
+    assert result.status == "ready"
+    assert result.executable
+    assert not result.automatic_verification_supported
     assert "collector" in result.unsupported_reason
     prompt = json.loads(model.calls[0][1][1])
     assert prompt["observation_options"] == []
@@ -217,7 +221,7 @@ def test_unknown_type_is_blocked(research, target, draft):
     assert not result.executable
 
 
-def test_sqli_plan_remains_unsupported_without_database_collector(research, target, draft):
+def test_sqli_plan_executes_without_database_collector(research, target, draft):
     research.vulnerability_type = "SQLi"
     research.observations = [ResearchObservation(
         effect="SQLi", evidence_kind="database_result",
@@ -227,19 +231,94 @@ def test_sqli_plan_remains_unsupported_without_database_collector(research, targ
     draft["vulnerability_type"] = "SQLi"
     draft["observation_indices"] = [0]
     result, _ = plan(research, target, draft)
-    assert result.status == "unsupported"
+    assert result.status == "ready"
     assert result.vulnerability_type == "SQLi"
     assert result.target_service == "web"
+    assert result.executable
     assert not result.automatic_verification_supported
-    assert not result.executable
     assert result.unsupported_reason in result.limitations
     assert "collector" in result.unsupported_reason
+
+
+def test_http_response_plan_freezes_source_grounded_probe(research, target, draft):
+    research.vulnerability_type = "File Read"
+    research.observations = [ResearchObservation(
+        effect="The passwd file is returned", evidence_kind="http_response",
+        http_probe=ResearchHttpProbe(
+            path="/icons/.%2e/%2e%2e/etc/passwd", expected_status=200,
+            body_contains="root:x:0:0",
+        ),
+        summary="The documented file content is returned.", source="local README",
+        quote="GET /icons/.%2e/%2e%2e/etc/passwd returns 200 with root:x:0:0",
+        basis="explicit",
+    )]
+    draft["vulnerability_type"] = "File Read"
+    draft["observation_indices"] = [0]
+    result, model = plan(research, target, draft)
+
+    assert result.automatic_verification_supported
+    expectation = result.verification_contract.http_expectations[0]
+    assert expectation.path == "/icons/.%2e/%2e%2e/etc/passwd"
+    assert expectation.body_contains == "root:x:0:0"
+    assert expectation.source == "local README"
+    assert json.loads(model.calls[0][1][1])["observation_options"][0]["http_probe"]["expected_status"] == 200
+
+
+def test_sqli_plan_freezes_exact_database_result_probe(research, target, draft):
+    research.vulnerability_type = "SQLi"
+    research.observations = [ResearchObservation(
+        effect="A database-derived value is returned", evidence_kind="database_result",
+        database_probe=ResearchDatabaseProbe(
+            http_probe=ResearchHttpProbe(path="/api/users?id=1%27", expected_status=200),
+            result_contains="admin@example.test",
+        ),
+        summary="The documented database value is returned.", source="local README",
+        quote="GET /api/users?id=1%27 returns 200 with admin@example.test", basis="explicit",
+    )]
+    draft["vulnerability_type"] = "SQLi"
+    draft["observation_indices"] = [0]
+    result, _ = plan(research, target, draft)
+
+    assert result.automatic_verification_supported
+    expectation = result.verification_contract.database_results[0]
+    assert expectation.result_contains == "admin@example.test"
+    assert expectation.probe.body_contains == "admin@example.test"
+    assert expectation.probe.path == "/api/users?id=1%27"
+
+
+def test_auth_bypass_state_change_plan_is_ready(research, target, draft):
+    research.vulnerability_type = "Auth Bypass"
+    research.observations = [ResearchObservation(
+        effect="Authentication bypass", evidence_kind="state_change",
+        state_indicator="authentication", state_before="anonymous", state_after="authenticated",
+        summary="A forged cookie changes anonymous access to authenticated access.",
+        source="local README", quote="logged-in administration page", basis="analysis",
+    )]
+    draft["vulnerability_type"] = "Auth Bypass"
+    draft["observation_indices"] = [0]
+
+    result, model = plan(research, target, draft)
+
+    assert result.status == "ready"
+    assert result.vulnerability_type == "Auth Bypass"
+    assert result.target_service == "web"
+    assert result.automatic_verification_supported
+    assert result.executable
+    assert result.verification_contract.result_label == "auth_bypass_confirmed"
+    assert [item.kind for item in result.verification_contract.evidence_requirements] == ["state_change"]
+    assert [(item.indicator, item.before, item.after)
+            for item in result.verification_contract.state_changes] == [
+        ("authentication", "anonymous", "authenticated"),
+    ]
+    prompt = json.loads(model.calls[0][1][1])
+    assert [item["evidence_kind"] for item in prompt["observation_options"]] == ["state_change"]
 
 
 def test_file_write_plan_with_file_artifact_is_ready(research, target, draft):
     research.vulnerability_type = "File Write"
     research.observations = [ResearchObservation(
         effect="File Write", evidence_kind="file_artifact",
+        artifact_path="/opt/activemq/webapps/api/s.jsp",
         summary="The documented file is created.",
         source="local README", quote="file created", basis="analysis",
     )]
@@ -250,6 +329,37 @@ def test_file_write_plan_with_file_artifact_is_ready(research, target, draft):
     assert result.executable
     assert result.automatic_verification_supported
     assert result.verification_contract.result_label == "file_write_confirmed"
+
+
+def test_file_write_plan_accepts_multiple_source_grounded_alternatives(research, target, draft):
+    research.vulnerability_type = "File Write"
+    research.observations = [
+        ResearchObservation(
+            effect="Cron file written", evidence_kind="file_artifact",
+            artifact_path="/etc/cron.d/root",
+            summary="The documented cron file is created.",
+            source="local README", quote="cron file created", basis="explicit",
+        ),
+        ResearchObservation(
+            effect="JSP file written", evidence_kind="file_artifact",
+            artifact_path="/opt/activemq/webapps/api/s.jsp",
+            summary="The documented JSP file is created.",
+            source="local README", quote="jsp file created", basis="explicit",
+        ),
+    ]
+    draft["vulnerability_type"] = "File Write"
+    draft["observation_indices"] = [0, 1]
+    draft["acceptance_policy"] = "any"
+
+    result, model = plan(research, target, draft)
+
+    assert result.status == "ready"
+    assert len(result.verification_contract.evidence_requirements) == 1
+    assert [item.path_pattern for item in result.verification_contract.file_artifacts] == [
+        "/etc/cron.d/root", "/opt/activemq/webapps/api/s.jsp",
+    ]
+    prompt = json.loads(model.calls[0][1][1])
+    assert len(prompt["observation_options"]) == 2
 
 
 @pytest.mark.parametrize("source", ["research", "target"])
@@ -381,19 +491,31 @@ def test_session_only_selection_is_promoted_to_required(research, target, draft)
     assert requirement.kind == "session" and requirement.required
 
 
-@pytest.mark.parametrize("indices", [[-1], [99], [True], ["0"]])
-def test_observation_indices_must_select_existing_research(research, target, draft, indices):
+@pytest.mark.parametrize("indices", [[-1], [99]])
+def test_invalid_observation_indices_only_limit_verification(research, target, draft, indices):
+    draft["observation_indices"] = indices
+    result, _ = plan(research, target, draft)
+    assert result.status == "ready"
+    assert result.executable
+    assert result.validation_errors == []
+    assert any("观察索引" in error for error in result.limitations)
+
+
+@pytest.mark.parametrize("indices", [[True], ["0"]])
+def test_invalid_observation_index_types_block_plan(research, target, draft, indices):
     draft["observation_indices"] = indices
     result, _ = plan(research, target, draft)
     assert result.status == "blocked"
     assert not result.executable
 
 
-def test_missing_observation_selection_blocks_plan(research, target, draft):
+def test_missing_observation_selection_only_limits_verification(research, target, draft):
     draft["observation_indices"] = []
     result, _ = plan(research, target, draft)
-    assert result.status == "blocked"
-    assert any("观察" in error for error in result.validation_errors)
+    assert result.status == "ready"
+    assert result.executable
+    assert result.validation_errors == []
+    assert any("观察" in error for error in result.limitations)
 
 
 def test_model_cannot_submit_rule_names_or_patterns(research, target, draft):
@@ -427,7 +549,7 @@ def test_duplicate_rule_observation_is_not_offered_to_planner(research, target, 
         update={"summary": "A second command-output effect must be established separately."},
     )
     result, model = plan(research, target, draft)
-    assert result.status == "blocked"
-    assert not result.executable
+    assert result.status == "ready"
+    assert result.executable
     assert "A second command-output effect" not in model.calls[0][1][1]
-    assert any("没有已实现的自动验证规则" in error for error in result.validation_errors)
+    assert any("没有已实现的自动验证规则" in error for error in result.limitations)

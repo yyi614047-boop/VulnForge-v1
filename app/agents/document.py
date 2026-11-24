@@ -1,5 +1,6 @@
 """Turn local target files into a source-grounded Markdown document."""
 import base64
+import json
 from html.parser import HTMLParser
 import html
 import mimetypes
@@ -45,13 +46,14 @@ class DocumentAgent:
         self.max_images = max_images
         self.max_image_bytes = max_image_bytes
 
-    def run(self, material: TargetMaterial, *, language: str = "zh") -> str:
+    def run(self, material: TargetMaterial, *, language: str = "zh",
+            runtime_info: dict | None = None) -> str:
         if language not in {"zh", "en"}:
             raise ValueError("language must be 'zh' or 'en'.")
         document = material.document
         document_text = document.content if document else ""
         image_payloads, image_notes = self._read_referenced_images(document_text, material.environment)
-        prompt_text = self._build_prompt(material, image_notes, language)
+        prompt_text = self._build_prompt(material, image_notes, language, runtime_info)
         content = prompt_text
         if image_payloads:
             content = [{"type": "text", "text": prompt_text}, *image_payloads]
@@ -94,8 +96,11 @@ class DocumentAgent:
             markdown = missing_note + markdown
         return markdown
 
-    def _build_prompt(self, material: TargetMaterial, image_notes: list[str], language: str) -> str:
+    def _build_prompt(self, material: TargetMaterial, image_notes: list[str], language: str,
+                      runtime_info: dict | None = None) -> str:
         sections = [f"Target identifier: {material.identifier}"]
+        if runtime_info:
+            sections.append("Runtime information:\n" + json.dumps(runtime_info, ensure_ascii=False, default=str))
         if material.document:
             sections.append(
                 f"README source: {material.document.path}\n"

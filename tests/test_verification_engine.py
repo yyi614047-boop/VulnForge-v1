@@ -5,13 +5,14 @@ from pydantic import ValidationError
 
 from app.agents.execution import ExecutionResult
 from app.verification.collector import EvidenceCollector
-from app.verification.contracts import EvidenceRequirement, VerificationContract
+from app.verification.contracts import EvidenceRequirement, FileArtifactExpectation, VerificationContract
 from app.verification.engine import VerificationEngine
 from app.verification.models import (
-    CommandExpectation, Evidence, EvidenceBundle, FileArtifactExpectation, RuleResult, VerificationPolicy,
+    CommandExpectation, Evidence, EvidenceBundle, RuleResult, VerificationPolicy,
 )
 from app.verification.policy import build_verification_policy, compute_policy_id
 from app.verification.registry import (
+    EVIDENCE_RULES, VULNERABILITY_TYPES,
     EvidenceRuleDefinition, EvidenceRuleRegistry, VulnerabilityTypeDefinition,
     VulnerabilityTypeRegistry, copy_rule_registry, validate_contract,
 )
@@ -65,6 +66,16 @@ def session(*, sid="2", host="172.22.0.4", kind="shell", module="multi/http/exam
             "via_exploit": module, "exploit_uuid": job}
 
 
+def test_every_known_vulnerability_type_has_implemented_evidence_coverage():
+    for definition in EVIDENCE_RULES.definitions:
+        assert definition.implemented
+    for definition in VULNERABILITY_TYPES.definitions:
+        if not definition.known:
+            continue
+        assert any(rule.implemented and rule.kind in definition.allowed_evidence_kinds
+                   for rule in EVIDENCE_RULES.definitions)
+
+
 def test_policy_is_deterministic_frozen_and_contract_driven(verification_contracts):
     p = policy(contract=verification_contracts["session"])
     assert p.accepted_rules == ("session_established",)
@@ -73,9 +84,9 @@ def test_policy_is_deterministic_frozen_and_contract_driven(verification_contrac
     p2 = policy(contract=verification_contracts["command_optional_session"])
     assert p2.accepted_rules == ("command_output_match", "session_established")
     assert p2.policy_id == compute_policy_id(p2)
-    unsupported = policy(category="SQLi", contract=verification_contracts["http"])
-    assert unsupported.unsupported_reason and unsupported.accepted_rules == ()
-    assert "collector" in unsupported.unsupported_reason
+    supported_http = policy(category="SQLi", contract=verification_contracts["http"])
+    assert supported_http.unsupported_reason is None
+    assert supported_http.accepted_rules == ("http_response_observed",)
 
 
 def test_policy_id_covers_the_complete_contract(verification_contracts, command_expectation):
@@ -90,6 +101,13 @@ def test_new_linked_supported_session_proves_rce():
     outcome = VerificationEngine().verify(policy=policy(), execution=result, evidence=bundle(result))
     assert outcome.status == "success"
     assert outcome.rule_results[0].status == "success"
+
+
+def test_failed_job_can_still_succeed_from_trusted_evidence():
+    result = execution(status="failed", job_status="errored", session_after=[session()])
+    outcome = VerificationEngine().verify(policy=policy(), execution=result, evidence=bundle(result))
+    assert outcome.status == "success"
+    assert outcome.matched_rule_names == ("session_established",)
 
 
 @pytest.mark.parametrize("row,baseline", [
@@ -154,11 +172,12 @@ def test_file_artifact_expectation_is_frozen_and_new_file_proves_write():
             description="A new file is observed.",
         ),),
         result_label="file_write_confirmed",
+        file_artifacts=(expectation,),
     )
     p = build_verification_policy(
         run_id="run-1", target_id="container-1", vulnerability_type="File Write",
         contract=contract, module_type="exploit", module_name="exploit/multi/http/example",
-        file_artifact_supported=True, file_expectations=(expectation,),
+        file_artifact_supported=True,
     )
     row = {"source": "vulhub_runtime_file_artifact", "execution_id": "exec-1",
            "target_id": "container-1", "path_pattern": expectation.path_pattern,
@@ -179,6 +198,34 @@ def test_file_artifact_expectation_is_frozen_and_new_file_proves_write():
         "path_pattern": "/opt/*/webapps/admin/vulnforge_probe.jsp",
     }),)})
     assert compute_policy_id(changed) != p.policy_id
+
+
+def test_file_artifact_alternatives_accept_any_new_source_grounded_path():
+    first = FileArtifactExpectation(path_pattern="/etc/cron.d/root", source="builtin:test")
+    second = FileArtifactExpectation(path_pattern="/opt/activemq/webapps/api/s.jsp", source="builtin:test")
+    contract = VerificationContract(
+        evidence_requirements=(EvidenceRequirement(
+            kind="file_artifact", rule_name="file_artifact_observed",
+            description="A new file is observed.",
+        ),),
+        result_label="file_write_confirmed",
+        file_artifacts=(first, second),
+    )
+    p = build_verification_policy(
+        run_id="run-1", target_id="container-1", vulnerability_type="File Write",
+        contract=contract, module_type="exploit", module_name="exploit/multi/http/example",
+        file_artifact_supported=True,
+    )
+    row = {"source": "vulhub_runtime_file_artifact", "execution_id": "exec-1",
+           "target_id": "container-1", "path_pattern": second.path_pattern,
+           "existed_before": False, "exists_after": True,
+           "new_files": [{"path": "/opt/apache-activemq-5.11.1/webapps/admin/s.jsp"}]}
+    result = execution(verification_policy=p, file_artifact_evidence=[row])
+
+    outcome = VerificationEngine().verify(policy=p, execution=result, evidence=bundle(result))
+
+    assert outcome.status == "success"
+    assert outcome.matched_rule_names == ("file_artifact_observed",)
 
 
 def test_file_artifact_expectation_rejects_unsafe_paths():
@@ -296,14 +343,15 @@ def test_policy_fingerprint_mutation_is_rejected():
     assert VerificationEngine().verify(policy=changed, execution=result, evidence=bundle(result)).status == "failed"
 
 
-def test_execution_id_binding_and_explicit_failure_are_rejected():
+def test_execution_id_binding_and_rejection_are_rejected():
     frozen = policy()
     result = execution(verification_policy=frozen)
     wrong = EvidenceBundle(run_id="run-1", target_id="container-1", execution_id="other")
     assert VerificationEngine().verify(policy=frozen, execution=result, evidence=wrong).status == "failed"
-    for status in ("failed", "rejected"):
-        failed = execution(verification_policy=frozen, status=status)
-        assert VerificationEngine().verify(policy=frozen, execution=failed, evidence=bundle(failed)).status == "failed"
+    rejected = execution(verification_policy=frozen, status="rejected")
+    assert VerificationEngine().verify(policy=frozen, execution=rejected, evidence=bundle(rejected)).status == "failed"
+    failed = execution(verification_policy=frozen, status="failed")
+    assert VerificationEngine().verify(policy=frozen, execution=failed, evidence=bundle(failed)).status == "inconclusive"
 
 
 @pytest.mark.parametrize("rule_status,expected", [
@@ -365,9 +413,9 @@ def test_contract_validation_rejects_missing_duplicate_and_unknown_rules(verific
     assert "Unrecognized vulnerability type" in validate_contract(
         vulnerability_type="Invented", contract=verification_contracts["command"],
     )
-    assert "collector" in validate_contract(
+    assert validate_contract(
         vulnerability_type="RCE", contract=verification_contracts["http"],
-    )
+    ) is None
 
 
 def test_policy_backend_capabilities_only_constrain_required_evidence(verification_contracts,

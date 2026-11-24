@@ -277,6 +277,90 @@ def test_observations_require_registered_kind_and_exact_source_quote():
     instructions = model.messages[0][1]
     assert "Do not create a reproduction plan" in instructions
     assert "select Metasploit modules or payloads" in instructions
+    assert "must be allowed for the selected vulnerability_type" in instructions
+    assert "never a web login session" in instructions
+    assert "never output\nfrom an offline cracking or signing tool" in instructions
+
+
+def test_auth_bypass_observations_use_state_change_not_shell_or_offline_output():
+    document = (
+        "The forged session cookie grants access to the logged-in administration page. "
+        "The offline signing tool prints temporary_key."
+    )
+    result, _ = run_with(None, document, {
+        "cve_id": CVE,
+        "vulnerability_type": "Auth Bypass",
+        "observations": [
+            {
+                "effect": "Web login session",
+                "evidence_kind": "session",
+                "summary": "A browser session is authenticated.",
+                "source": "Document Agent Markdown",
+                "quote": "grants access to the logged-in administration page",
+                "basis": "analysis",
+            },
+            {
+                "effect": "Offline key recovery",
+                "evidence_kind": "command_output",
+                "summary": "The local signing tool prints the key.",
+                "source": "Document Agent Markdown",
+                "quote": "offline signing tool prints temporary_key",
+                "basis": "explicit",
+            },
+            {
+                "effect": "Authentication bypass",
+                "evidence_kind": "state_change",
+                "state_indicator": "authentication",
+                "state_before": "anonymous",
+                "state_after": "authenticated",
+                "summary": "The forged cookie changes the request from anonymous to authenticated.",
+                "source": "Document Agent Markdown",
+                "quote": "grants access to the logged-in administration page",
+                "basis": "analysis",
+            },
+        ],
+    })
+
+    assert [item.evidence_kind for item in result.observations] == ["state_change"]
+    assert any("Auth Bypass 不匹配" in item for item in result.limitations)
+
+
+def test_state_change_observation_requires_concrete_transition():
+    document = "The forged cookie grants access to the logged-in administration page."
+    result, _ = run_with(None, document, {
+        "cve_id": CVE,
+        "vulnerability_type": "Auth Bypass",
+        "observations": [{
+            "effect": "Authentication bypass",
+            "evidence_kind": "state_change",
+            "summary": "The forged cookie grants access.",
+            "source": "Document Agent Markdown",
+            "quote": document,
+            "basis": "analysis",
+        }],
+    })
+
+    assert result.observations == []
+    assert any("indicator/before/after" in item for item in result.limitations)
+
+
+def test_observation_kind_must_match_vulnerability_type():
+    document = "The local material describes an HTTP response."
+    result, _ = run_with(None, document, {
+        "cve_id": CVE,
+        "vulnerability_type": "File Read",
+        "observations": [{
+            "effect": "Unrelated state change",
+            "evidence_kind": "state_change",
+            "summary": "Not a file-read evidence channel.",
+            "source": "Document Agent Markdown",
+            "quote": document,
+            "basis": "analysis",
+        }],
+    })
+
+    assert result.observations == []
+    assert any("File Read 不匹配" in item for item in result.limitations)
 
 
 def test_s2_057_material_yields_command_and_http_observations():
@@ -302,15 +386,136 @@ def test_s2_057_material_yields_command_and_http_observations():
     assert all(item.quote in document for item in result.observations)
 
 
+def test_http_probe_must_be_fully_grounded_in_exact_quote():
+    document = "GET /icons/.%2e/%2e%2e/etc/passwd returns HTTP 200 with root:x:0:0."
+    result, _ = run_with(None, document, {
+        "cve_id": CVE, "vulnerability_type": "File Read",
+        "observations": [{
+            "effect": "File Read", "evidence_kind": "http_response",
+            "http_probe": {"path": "/icons/.%2e/%2e%2e/etc/passwd",
+                           "expected_status": 200, "body_contains": "root:x:0:0"},
+            "summary": "The file content is returned.", "source": "Document Agent Markdown",
+            "quote": document, "basis": "explicit",
+        }],
+    })
+    assert result.observations[0].http_probe.path == "/icons/.%2e/%2e%2e/etc/passwd"
+
+    result, _ = run_with(None, document, {
+        "cve_id": CVE, "vulnerability_type": "File Read",
+        "observations": [{
+            "effect": "File Read", "evidence_kind": "http_response",
+            "http_probe": {"path": "/invented", "expected_status": 200,
+                           "body_contains": "root:x:0:0"},
+            "summary": "Invented probe.", "source": "Document Agent Markdown",
+            "quote": document, "basis": "analysis",
+        }],
+    })
+    assert result.observations[0].http_probe is None
+    assert any("HTTP 验证探针" in item for item in result.limitations)
+
+
+def test_database_probe_requires_exact_request_and_result_quote():
+    document = "GET /api/users?id=1%27 returns HTTP 200 with admin@example.test."
+    result, _ = run_with(None, document, {
+        "cve_id": CVE, "vulnerability_type": "SQLi",
+        "observations": [{
+            "effect": "SQLi", "evidence_kind": "database_result",
+            "database_probe": {"http_probe": {"path": "/api/users?id=1%27", "expected_status": 200},
+                               "result_contains": "admin@example.test"},
+            "summary": "Database value returned.", "source": "Document Agent Markdown",
+            "quote": document, "basis": "explicit",
+        }],
+    })
+    assert result.observations[0].database_probe.result_contains == "admin@example.test"
+
+    result, _ = run_with(None, document, {
+        "cve_id": CVE, "vulnerability_type": "SQLi",
+        "observations": [{
+            "effect": "SQLi", "evidence_kind": "database_result",
+            "database_probe": {"http_probe": {"path": "/invented", "expected_status": 200},
+                               "result_contains": "admin@example.test"},
+            "summary": "Invented database value.", "source": "Document Agent Markdown",
+            "quote": document, "basis": "analysis",
+        }],
+    })
+    assert result.observations[0].database_probe is None
+    assert any("数据库结果探针" in item for item in result.limitations)
+
+
+def test_http_probe_validation_does_not_shadow_grounding_for_later_observations():
+    first = "GET /icons/.%2e/etc/passwd returns HTTP 200 with root:x:0:0."
+    second = "POST /api/query returns HTTP 200 with database-result."
+    result, _ = run_with(None, first + "\n" + second, {
+        "cve_id": CVE, "vulnerability_type": "File Read",
+        "observations": [
+            {"effect": "File Read", "evidence_kind": "http_response",
+             "http_probe": {"path": "/icons/.%2e/etc/passwd", "expected_status": 200,
+                            "body_contains": "root:x:0:0"},
+             "summary": "File content.", "source": "Document Agent Markdown",
+             "quote": first, "basis": "explicit"},
+            {"effect": "Another response", "evidence_kind": "http_response",
+             "http_probe": {"path": "/api/query", "method": "POST", "expected_status": 200,
+                            "body_contains": "database-result"},
+             "summary": "Response content.", "source": "Document Agent Markdown",
+             "quote": second, "basis": "explicit"},
+        ],
+    })
+    assert len(result.observations) == 2
+    assert all(item.http_probe is not None for item in result.observations)
+
+
+def test_file_artifact_path_must_appear_in_exact_quote():
+    document = "The payload creates /opt/activemq/webapps/api/s.jsp."
+    result, _ = run_with(None, document, {
+        "cve_id": CVE,
+        "vulnerability_type": "File Write",
+        "observations": [{
+            "effect": "File Write",
+            "evidence_kind": "file_artifact",
+            "artifact_path": "/opt/activemq/webapps/api/s.jsp",
+            "summary": "The JSP file is created.",
+            "source": "Document Agent Markdown",
+            "quote": "creates /opt/activemq/webapps/api/s.jsp",
+            "basis": "explicit",
+        }],
+    })
+    assert result.observations[0].artifact_path == "/opt/activemq/webapps/api/s.jsp"
+
+    result, _ = run_with(None, document, {
+        "cve_id": CVE,
+        "vulnerability_type": "File Write",
+        "observations": [{
+            "effect": "File Write",
+            "evidence_kind": "file_artifact",
+            "artifact_path": "/tmp/invented.jsp",
+            "summary": "A file is created.",
+            "source": "Document Agent Markdown",
+            "quote": "creates /opt/activemq/webapps/api/s.jsp",
+            "basis": "explicit",
+        }],
+    })
+    assert result.observations[0].artifact_path is None
+    assert any("文件路径" in item for item in result.limitations)
+
+
 @pytest.mark.parametrize("category", ["SQLi", "File Read", "File Write", "SSRF", "Auth Bypass"])
 def test_non_rce_vulnerability_types_are_accepted(category):
     document = "The local material describes the vulnerability effect."
+    evidence_kind = {
+        "SQLi": "state_change",
+        "File Read": "http_response",
+        "File Write": "state_change",
+        "SSRF": "http_response",
+        "Auth Bypass": "state_change",
+    }[category]
     result, _ = run_with(None, document, {
         "cve_id": CVE,
         "vulnerability_type": category,
         "observations": [{
             "effect": category,
-            "evidence_kind": "http_response" if category == "SSRF" else "state_change",
+            "evidence_kind": evidence_kind,
+            **({"state_indicator": "state", "state_before": "before", "state_after": "after"}
+               if evidence_kind == "state_change" else {}),
             "summary": "An observable state is described.",
             "source": "Document Agent Markdown",
             "quote": document,
@@ -318,4 +523,4 @@ def test_non_rce_vulnerability_types_are_accepted(category):
         }],
     })
     assert result.vulnerability_type == category
-    assert result.observations[0].evidence_kind in {"http_response", "state_change"}
+    assert result.observations[0].evidence_kind == evidence_kind

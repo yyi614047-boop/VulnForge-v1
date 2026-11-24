@@ -1,6 +1,7 @@
 """Build a bounded reproduction plan from existing research and local target data."""
 import json
 import re
+import secrets
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, computed_field
@@ -8,7 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, computed_fie
 from app.agents.research import ResearchObservation, ResearchResult
 from app.agents.runner import AgentRunner
 from app.targets.material import TargetMaterial
-from app.verification.contracts import EvidenceRequirement, FileArtifactExpectation, VerificationContract
+from app.verification.contracts import (
+    DatabaseResultExpectation,
+    HttpExpectation,
+    OobExpectation,
+    EvidenceRequirement,
+    FileArtifactExpectation,
+    StateChangeExpectation,
+    VerificationContract,
+)
 from app.verification.registry import (
     EVIDENCE_RULES,
     VULNERABILITY_TYPES,
@@ -41,13 +50,8 @@ class ReproductionPlan(BaseModel):
         """Planning eligibility only; execution still requires runtime authorization."""
         return (
             self.status == "ready"
-            and self.verification_contract is not None
             and self.target_service is not None
             and not self.validation_errors
-            and validate_contract(
-                vulnerability_type=self.vulnerability_type,
-                contract=self.verification_contract,
-            ) is None
         )
 
     @computed_field
@@ -94,6 +98,8 @@ _ERRORS_ZH = {
     "The planner did not select a research observation.": "Planner 未选择任何研究观察。",
     "A proposed observation index does not refer to existing research.": "所选观察索引不在已有研究结果中。",
     "A selected observation is not eligible for automatic verification.": "所选观察没有已实现的自动验证规则支持。",
+    "A file artifact observation does not provide an exact source-grounded path.": "文件证据观察没有提供精确且有出处的目标路径。",
+    "A selected state-change observation does not provide a concrete indicator/before/after expectation.": "所选状态变化观察没有提供明确的 indicator/before/after 期望。",
     "A selected observation uses an unregistered evidence kind.": "所选观察使用了未注册的证据种类。",
     "Multiple selected observations map to the same evidence rule.": "多个所选观察映射到了同一条证据规则。",
 }
@@ -105,11 +111,14 @@ vulnerability type exactly. Select an existing target service only when research
 configuration justify that choice; otherwise return null and information_sufficient=false.
 prerequisite_indices selects zero-based entries from the supplied prerequisite_options.
 observation_indices selects zero-based entries from observation_options. Only observations
-backed by implemented evidence rules are offered, and at most one option is offered per rule.
-Select observations that can establish the researched effect; do not select a session merely
-because a module may support one. acceptance_policy is 'any' when one selected required
-observation is enough, or 'all' when every selected required observation must be established. The application maps the
-selected observations to registered evidence rules and freezes the final contract.
+backed by implemented evidence rules are offered. Select observations that can establish the
+researched effect; do not select a session merely because a module may support one. Here 'session'
+means an interactive Metasploit shell session, not a web login session. For file_artifact observations
+with acceptance_policy 'any', select all offered source-grounded
+alternatives for the same effect so runtime deployment-path differences do not invalidate
+verification. acceptance_policy is 'any' when one selected required observation or file alternative is
+enough, or 'all' when every selected required observation must be established. The application maps
+the selected observations to registered evidence rules and freezes the final contract.
 Do not infer missing prerequisites from the CVE identifier or model memory. Preserve uncertainty
 and conflicts. Optional Document Agent Markdown may clarify context but cannot override the
 ResearchResult's vulnerability type or supply new deployment facts.
@@ -140,10 +149,13 @@ class PlannerAgent:
             if (rule is None or not rule.implemented or rule.verifier is None
                     or observation.evidence_kind not in definition.allowed_evidence_kinds
                     or (observation.evidence_kind == "file_artifact" and not observation.artifact_path)
-                    or rule.rule_name in seen_rules):
+                    or (observation.evidence_kind == "http_response" and observation.http_probe is None)
+                    or (observation.evidence_kind == "database_result" and observation.database_probe is None)
+                    or (rule.kind != "file_artifact" and rule.rule_name in seen_rules)):
                 continue
             indices.append(index)
-            seen_rules.add(rule.rule_name)
+            if rule.kind != "file_artifact":
+                seen_rules.add(rule.rule_name)
         return indices
 
     def run(self, *, cve_id: str, research: ResearchResult, target: TargetMaterial,
@@ -183,6 +195,14 @@ class PlannerAgent:
                     "index": index,
                     "effect": research.observations[index].effect,
                     "evidence_kind": research.observations[index].evidence_kind,
+                    "artifact_path": research.observations[index].artifact_path,
+                    "state_indicator": research.observations[index].state_indicator,
+                    "state_before": research.observations[index].state_before,
+                    "state_after": research.observations[index].state_after,
+                    "http_probe": (research.observations[index].http_probe.model_dump(mode="json")
+                                   if research.observations[index].http_probe else None),
+                    "database_probe": (research.observations[index].database_probe.model_dump(mode="json")
+                                       if research.observations[index].database_probe else None),
                     "rule_name": EVIDENCE_RULES.for_kind(research.observations[index].evidence_kind).rule_name,
                     "summary": research.observations[index].summary,
                 }
@@ -236,12 +256,13 @@ class PlannerAgent:
             else:
                 selected_prerequisites.append(options[index])
 
+        verification_errors = []
         if eligible_indices:
             contract, contract_errors = self._contract_from_observations(
                 research, draft.observation_indices, draft.acceptance_policy,
                 eligible_indices=set(eligible_indices),
             )
-            errors.extend(contract_errors)
+            verification_errors.extend(contract_errors)
             unsupported_reason = (
                 validate_contract(vulnerability_type=research.vulnerability_type, contract=contract)
                 if contract is not None else None
@@ -254,6 +275,7 @@ class PlannerAgent:
         return self._finish(
             cve_id, research, selected_service, selected_prerequisites,
             contract, unsupported_reason, errors, language,
+            verification_errors=verification_errors,
         )
 
     @staticmethod
@@ -278,14 +300,83 @@ class PlannerAgent:
 
         has_non_session = any(observation.evidence_kind != "session" for observation in selected)
         requirements = []
+        file_artifacts = []
+        state_changes = []
+        http_expectations = []
+        oob_expectations = []
+        database_results = []
         seen_rules = set()
+        seen_paths = set()
         for observation in selected:
             rule = EVIDENCE_RULES.for_kind(observation.evidence_kind)
             if rule is None:
                 errors.append("A selected observation uses an unregistered evidence kind.")
                 continue
-            if rule.rule_name in seen_rules:
+            duplicate_rule = rule.rule_name in seen_rules
+            if duplicate_rule and rule.kind != "file_artifact":
                 errors.append("Multiple selected observations map to the same evidence rule.")
+                continue
+            if rule.kind == "state_change" and rule.rule_name == "state_change_observed":
+                try:
+                    state_changes.append(StateChangeExpectation(
+                        indicator=observation.state_indicator,
+                        before=observation.state_before,
+                        after=observation.state_after,
+                        source=observation.source,
+                    ))
+                except ValidationError:
+                    errors.append(
+                        "A selected state-change observation does not provide a concrete "
+                        "indicator/before/after expectation."
+                    )
+                    continue
+            if rule.kind == "database_result":
+                if observation.database_probe is None:
+                    errors.append("A database result observation does not provide a source-grounded probe.")
+                    continue
+                database = observation.database_probe
+                probe_data = database.http_probe.model_dump()
+                probe_data["headers"] = tuple(database.http_probe.headers.items())
+                if probe_data.get("body_contains") is None and probe_data.get("header_contains") is None:
+                    probe_data["body_contains"] = database.result_contains
+                try:
+                    database_results.append(DatabaseResultExpectation(
+                        probe=HttpExpectation(**probe_data, source=observation.source),
+                        result_contains=database.result_contains, source=observation.source,
+                    ))
+                except ValidationError:
+                    errors.append("A database result observation contains an invalid probe.")
+                    continue
+            if rule.kind == "oob_callback":
+                token = secrets.token_urlsafe(18)
+                oob_expectations.append(OobExpectation(
+                    token=token, path=f"/oob/{token}", source=observation.source,
+                ))
+            if rule.kind == "http_response":
+                if observation.http_probe is None:
+                    errors.append("An HTTP response observation does not provide a source-grounded probe.")
+                    continue
+                try:
+                    probe_data = observation.http_probe.model_dump()
+                    probe_data["headers"] = tuple(observation.http_probe.headers.items())
+                    http_expectations.append(HttpExpectation(
+                        **probe_data, source=observation.source,
+                    ))
+                except ValidationError:
+                    errors.append("An HTTP response observation contains an invalid probe.")
+                    continue
+            if rule.kind == "file_artifact":
+                if not observation.artifact_path:
+                    errors.append("A file artifact observation does not provide an exact source-grounded path.")
+                    continue
+                if observation.artifact_path in seen_paths:
+                    continue
+                seen_paths.add(observation.artifact_path)
+                file_artifacts.append(FileArtifactExpectation(
+                    path_pattern=observation.artifact_path,
+                    source=observation.source,
+                ))
+            if duplicate_rule:
                 continue
             seen_rules.add(rule.rule_name)
             description = (observation.summary or observation.effect or "Expected observable effect.").strip()
@@ -307,6 +398,11 @@ class PlannerAgent:
                 research.vulnerability_type,
                 (requirement.kind for requirement in requirements if requirement.required),
             ),
+            file_artifacts=tuple(file_artifacts),
+            state_changes=tuple(state_changes),
+            http_expectations=tuple(http_expectations),
+            oob_expectations=tuple(oob_expectations),
+            database_results=tuple(database_results),
         )
         return contract, list(dict.fromkeys(errors))
 
@@ -314,9 +410,10 @@ class PlannerAgent:
     def _finish(cve_id: str, research: ResearchResult, target_service: str | None,
                 selected_prerequisites: list[str], contract: VerificationContract | None,
                 unsupported_reason: str | None, errors: list[str],
-                language: str = "zh") -> ReproductionPlan:
+                language: str = "zh", verification_errors: list[str] | None = None) -> ReproductionPlan:
         if language == "zh":
             errors = [_ERRORS_ZH.get(error, error) for error in errors]
+            verification_errors = [_ERRORS_ZH.get(error, error) for error in (verification_errors or [])]
         eligible_indices = PlannerAgent._implemented_observation_indices(research)
         if contract is None and eligible_indices:
             contract, _ = PlannerAgent._contract_from_observations(
@@ -329,13 +426,9 @@ class PlannerAgent:
         limitations = list(research.limitations)
         if unsupported_reason:
             limitations.append(unsupported_reason)
+        limitations.extend(verification_errors or [])
         limitations.extend(errors)
-        if errors:
-            status = "blocked"
-        elif unsupported_reason:
-            status = "unsupported"
-        else:
-            status = "ready"
+        status = "blocked" if errors else "ready"
         goal = (
             ("复现研究材料描述的可观察效果。" if language == "zh"
              else "Reproduce the observable effect described by the supplied research.")
@@ -357,12 +450,12 @@ class PlannerAgent:
             target_service=target_service,
             prerequisites=list(dict.fromkeys(research.prerequisites + selected_prerequisites)),
             execution_guidance=(
-                ("运行时解析目标、检查前置条件并获得授权后，使用 Metasploit 对已识别的本地目标服务进行验证。"
+                ("运行时解析目标、检查前置条件并获得授权后，使用 Metasploit 执行复现并记录结果。"
                  "以 research_context 为信息来源；模块选择由执行阶段负责。")
                 if language == "zh" else
                 "Use Metasploit within the identified local target service after runtime target "
-                "resolution, prerequisite checks and user authorization. Use the supplied "
-                "research_context as source information; module selection belongs to the execution stage."
+                "resolution, prerequisite checks and user authorization. Record the execution result; "
+                "module selection belongs to the execution stage."
             ),
             verification_goal=verification_goal,
             limitations=list(dict.fromkeys(limitations)),

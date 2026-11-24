@@ -1,6 +1,6 @@
 import pytest
 
-from app.verification.contracts import EvidenceRequirement, VerificationContract
+from app.verification.contracts import EvidenceRequirement, HttpExpectation, VerificationContract
 from app.verification.models import CommandExpectation
 from app.verification.policy import build_verification_policy
 
@@ -42,6 +42,10 @@ def verification_contracts():
                 description="A target-bound HTTP response is observed.",
             ),),
             result_label="ssrf_confirmed",
+            http_expectations=(HttpExpectation(
+                path="/fetch", expected_status=200, body_contains="internal-ok",
+                source="local README",
+            ),),
         ),
     }
 

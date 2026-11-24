@@ -19,20 +19,19 @@ def verify_file_artifact_observed(*, policy: VerificationPolicy,
 
     used = []
     for expectation in policy.file_expectations:
-        matched = False
         for record in records:
             metadata = record.metadata
             if (metadata.get("path_pattern") == expectation.path_pattern
                     and metadata.get("existed_before") is False
                     and metadata.get("exists_after") is True
                     and metadata.get("new_files")):
-                matched = True
                 used.append(record.evidence_id)
-                break
-        if not matched:
-            return RuleResult(rule_name="file_artifact_observed", status="inconclusive",
-                              reason="The frozen file artifact was not newly observed on the target.",
-                              evidence_ids=tuple(item.evidence_id for item in records))
-    return RuleResult(rule_name="file_artifact_observed", status="success",
-                      reason="All frozen file artifacts were newly observed on the target.",
-                      evidence_ids=tuple(dict.fromkeys(used)))
+                return RuleResult(
+                    rule_name="file_artifact_observed",
+                    status="success",
+                    reason="At least one frozen file artifact alternative was newly observed on the target.",
+                    evidence_ids=tuple(dict.fromkeys(used)),
+                )
+    return RuleResult(rule_name="file_artifact_observed", status="inconclusive",
+                      reason="No frozen file artifact alternative was newly observed on the target.",
+                      evidence_ids=tuple(item.evidence_id for item in records))

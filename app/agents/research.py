@@ -1,11 +1,12 @@
 """Research a vulnerability using only supplied local target material."""
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.agents.runner import AgentRunner
 from app.targets.material import TargetMaterial
-from app.verification.registry import EVIDENCE_RULES
+from app.verification.contracts import DatabaseResultExpectation, HttpExpectation, StateChangeExpectation, StateValue
+from app.verification.registry import EVIDENCE_RULES, VULNERABILITY_TYPES
 
 
 VulnerabilityType = Literal[
@@ -37,12 +38,38 @@ class ResearchEvidence(BaseModel):
     basis: Literal["explicit", "analysis"]
 
 
+class ResearchHttpProbe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scheme: Literal["http", "https"] = "http"
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] = "GET"
+    path: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: str = ""
+    expected_status: int
+    body_contains: str | None = None
+    header_name: str | None = None
+    header_contains: str | None = None
+
+
+class ResearchDatabaseProbe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    http_probe: ResearchHttpProbe
+    result_contains: str
+
+
 class ResearchObservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     effect: str
     evidence_kind: str
     artifact_path: str | None = None
+    state_indicator: str | None = None
+    state_before: StateValue | None = None
+    state_after: StateValue | None = None
+    http_probe: ResearchHttpProbe | None = None
+    database_probe: ResearchDatabaseProbe | None = None
     summary: str
     source: str
     quote: str
@@ -73,6 +100,10 @@ class ResearchResult(BaseModel):
 
 
 _EVIDENCE_KINDS = ", ".join(sorted(EVIDENCE_RULES.kinds))
+_EVIDENCE_KINDS_BY_TYPE = "\n".join(
+    f"- {name}: {', '.join(sorted(VULNERABILITY_TYPES.allowed_evidence_kinds(name)))}"
+    for name in VulnerabilityType.__args__ if name != "Unknown"
+)
 
 _INSTRUCTIONS = f"""Research the vulnerability using only the source material in the user message.
 Do not use remembered CVE details or infer facts from the CVE identifier alone. Do not search
@@ -87,10 +118,28 @@ fields. Each evidence entry must use the matching field name, exact source label
 quote from that source.
 Extract observable effects into observations: state what would be observed if the vulnerability
 were present, the evidence channel used to observe it, and a short summary. evidence_kind must be
-one of: {_EVIDENCE_KINDS}. An observation is an expected effect, not proof that this target has
-already been exploited. Every observation must use an exact source label and exact quote from that
-source. For an uploaded, created, replaced or written file, use evidence_kind 'file_artifact' and
-set artifact_path to the exact absolute target path stated in the quote; otherwise leave it null.
+one of: {_EVIDENCE_KINDS}, and must be allowed for the selected vulnerability_type:
+{_EVIDENCE_KINDS_BY_TYPE}
+The evidence kind 'session' means an interactive Metasploit shell session, never a web login session.
+The evidence kind 'command_output' means output from a command executed on the target, never output
+from an offline cracking or signing tool. For Auth Bypass, use 'state_change' for a documented
+transition from unauthenticated or unauthorized to authenticated or authorized; a login page or
+Set-Cookie header alone is not proof of bypass. For every 'state_change' observation, also set
+state_indicator, state_before and state_after to the concrete documented transition using short
+scalar values; leave them null when the material does not support the transition. An observation is
+an expected effect, not proof that this target has already been exploited. Every observation must
+use an exact source label and exact quote from that source. For an uploaded, created, replaced or
+written file, use evidence_kind 'file_artifact' and set artifact_path to the exact absolute filesystem
+path inside the target container stated in the quote; otherwise leave it null. A URL route such as
+/admin/shell.jsp is not a filesystem path unless the source explicitly identifies it as one.
+For an 'http_response' observation, set http_probe only when the quote contains a concrete request
+path and an exact expected status plus body or header match. Preserve encoded path segments exactly.
+Use body_contains for literal response-body evidence, or header_name plus header_contains for literal
+response-header evidence. Never invent a probe from the CVE identifier or general vulnerability knowledge.
+For a 'database_result' observation, set database_probe only when the quote contains a concrete
+HTTP request and an exact database-derived value returned in the response. database_probe must
+contain http_probe plus result_contains; both the request path and result value must be grounded
+in the exact quote. Do not treat a generic error, login page or timing change as a database result.
 Never infer or invent artifact_path. Use basis 'explicit' only when the quote
 directly states the observation, otherwise use 'analysis'. Do not create a reproduction plan, select Metasploit modules or payloads, define
 acceptance policy or verification rules, or claim successful exploitation.
@@ -169,11 +218,77 @@ class ResearchAgent:
         valid_observations = []
         invalid_observations = 0
         invalid_kinds = 0
+        invalid_type_kinds = 0
+        invalid_state_expectations = 0
         invalid_artifact_paths = 0
+        invalid_http_probes = 0
+        invalid_database_probes = 0
+        definition = VULNERABILITY_TYPES.get(result.vulnerability_type)
+        allowed_kinds = definition.allowed_evidence_kinds if definition else frozenset()
         for observation in result.observations:
             if observation.evidence_kind not in EVIDENCE_RULES.kinds:
                 invalid_kinds += 1
+            elif observation.evidence_kind not in allowed_kinds:
+                invalid_type_kinds += 1
             elif grounded(observation.source, observation.quote):
+                if observation.evidence_kind == "state_change":
+                    try:
+                        StateChangeExpectation(
+                            indicator=observation.state_indicator,
+                            before=observation.state_before,
+                            after=observation.state_after,
+                            source=observation.source,
+                        )
+                    except ValidationError:
+                        invalid_state_expectations += 1
+                        continue
+                if observation.evidence_kind == "database_result" and observation.database_probe is not None:
+                    database = observation.database_probe
+                    probe_data = database.http_probe.model_dump()
+                    probe_data["headers"] = tuple(database.http_probe.headers.items())
+                    if probe_data.get("body_contains") is None and probe_data.get("header_contains") is None:
+                        probe_data["body_contains"] = database.result_contains
+                    try:
+                        expectation = HttpExpectation(**probe_data, source=observation.source)
+                        DatabaseResultExpectation(
+                            probe=expectation, result_contains=database.result_contains,
+                            source=observation.source,
+                        )
+                        match_text = expectation.body_contains or expectation.header_contains or ""
+                        probe_grounded = (
+                            expectation.path in observation.quote
+                            and str(expectation.expected_status) in observation.quote
+                            and match_text in observation.quote
+                            and database.result_contains in observation.quote
+                            and (not expectation.body or expectation.body in observation.quote)
+                        )
+                        if not probe_grounded:
+                            raise ValueError("Database probe is not fully grounded in the exact quote")
+                    except (ValidationError, ValueError):
+                        valid_observations.append(observation.model_copy(update={"database_probe": None}))
+                        invalid_database_probes += 1
+                        continue
+                if observation.evidence_kind == "http_response" and observation.http_probe is not None:
+                    probe = observation.http_probe
+                    try:
+                        probe_data = probe.model_dump()
+                        probe_data["headers"] = tuple(probe.headers.items())
+                        expectation = HttpExpectation(
+                            **probe_data, source=observation.source,
+                        )
+                        match_text = expectation.body_contains or expectation.header_contains or ""
+                        probe_grounded = (
+                            expectation.path in observation.quote
+                            and str(expectation.expected_status) in observation.quote
+                            and match_text in observation.quote
+                            and (not expectation.body or expectation.body in observation.quote)
+                        )
+                        if not probe_grounded:
+                            raise ValueError("HTTP probe is not fully grounded in the exact quote")
+                    except (ValidationError, ValueError):
+                        valid_observations.append(observation.model_copy(update={"http_probe": None}))
+                        invalid_http_probes += 1
+                        continue
                 if observation.artifact_path and observation.artifact_path not in observation.quote:
                     valid_observations.append(observation.model_copy(update={"artifact_path": None}))
                     invalid_artifact_paths += 1
@@ -210,6 +325,32 @@ class ResearchAgent:
                 f"Removed {invalid_kinds} observation(s) with an unregistered evidence kind."
                 if language == "en" else
                 f"已移除 {invalid_kinds} 条使用未注册证据种类的观察。"
+            )
+        if invalid_type_kinds:
+            limitations.append(
+                f"Removed {invalid_type_kinds} observation(s) whose evidence kind is not allowed for "
+                f"{result.vulnerability_type}."
+                if language == "en" else
+                f"已移除 {invalid_type_kinds} 条证据种类与 {result.vulnerability_type} 不匹配的观察。"
+            )
+        if invalid_state_expectations:
+            limitations.append(
+                f"Removed {invalid_state_expectations} state-change observation(s) without a concrete "
+                "indicator/before/after expectation."
+                if language == "en" else
+                f"已移除 {invalid_state_expectations} 条缺少明确 indicator/before/after 的状态变化观察。"
+            )
+        if invalid_database_probes:
+            limitations.append(
+                f"Removed {invalid_database_probes} database probe(s) not fully grounded in the exact quote."
+                if language == "en" else
+                f"已移除 {invalid_database_probes} 个未在精确引用中完整溯源的数据库结果探针。"
+            )
+        if invalid_http_probes:
+            limitations.append(
+                f"Removed {invalid_http_probes} HTTP probe(s) that were not fully grounded in the exact quote."
+                if language == "en" else
+                f"已移除 {invalid_http_probes} 个未在精确引用中完整溯源的 HTTP 验证探针。"
             )
         if invalid_artifact_paths:
             limitations.append(

@@ -42,7 +42,26 @@ def test_inspect_file_artifact_uses_target_container_and_safe_arguments(tmp_path
     assert exec_call[-2:] == ["/opt", "/opt/*/webapps/api/vulnforge_probe.jsp"]
 
 
-@pytest.mark.parametrize("pattern", ["/etc/passwd", "/opt/../etc/passwd", "/opt/a;id"])
+def test_inspect_file_artifact_allows_etc_and_searches_same_basename(tmp_path):
+    runner = Runner()
+    runtime = VulhubDockerRuntime(tmp_path, metasploit_container="msf", runner=runner)
+    runtime._runs["run-1"] = {
+        "prefix": ["compose"],
+        "target": SimpleNamespace(environment=tmp_path),
+    }
+
+    result = runtime.inspect_file_artifact(
+        run_id="run-1", service="activemq",
+        path_pattern="/etc/cron.d/root",
+    )
+
+    assert result["path_pattern"] == "/etc/cron.d/root"
+    exec_call = next(call for call in runner.calls if call[:2] == ["docker", "exec"])
+    assert exec_call[-2:] == ["/etc", "/etc/cron.d/root"]
+    assert '-name "$base"' in exec_call[5]
+
+
+@pytest.mark.parametrize("pattern", ["/root/.ssh/id_rsa", "/opt/../etc/passwd", "/opt/a;id"])
 def test_inspect_file_artifact_rejects_unsafe_patterns(tmp_path, pattern):
     runtime = VulhubDockerRuntime(tmp_path, metasploit_container="msf", runner=Runner())
     runtime._runs["run-1"] = {

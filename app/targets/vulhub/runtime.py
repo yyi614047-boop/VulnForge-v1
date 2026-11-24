@@ -5,8 +5,10 @@ from contextlib import nullcontext
 import ipaddress
 import copy
 import json
+import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -18,6 +20,44 @@ from app.targets.material import TargetMaterial
 
 class VulhubRuntimeError(RuntimeError):
     pass
+
+
+_ENV_REFERENCE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|-)([^}]*))?\}"
+)
+_UNRESOLVED_ENV = re.compile(r"(?<!\$)\$(?:\{|[A-Za-z_])")
+
+
+def _resolve_compose_value(value):
+    if isinstance(value, dict):
+        return {key: _resolve_compose_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_compose_value(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    sentinel = "\u0000VULNFORGE_DOLLAR\u0000"
+    protected = value.replace("$$", sentinel)
+
+    def replace(match: re.Match[str]) -> str:
+        name, operator, default = match.groups()
+        current = os.environ.get(name)
+        if operator == ":-":
+            return current if current not in {None, ""} else default
+        if operator == "-":
+            return current if current is not None else default
+        if current is not None:
+            return current
+        return match.group(0)
+
+    return _ENV_REFERENCE.sub(replace, protected).replace(sentinel, "$$")
+
+
+def _has_unresolved_interpolation(value) -> bool:
+    if isinstance(value, dict):
+        return any(_has_unresolved_interpolation(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_unresolved_interpolation(item) for item in value)
+    return isinstance(value, str) and bool(_UNRESOLVED_ENV.search(value))
 
 
 class VulhubDockerRuntime:
@@ -39,7 +79,10 @@ class VulhubDockerRuntime:
     def _call(self, argv: list[str], *, cwd: Path | None = None, live_progress=False,
               include_stderr=False) -> str:
         try:
-            streams = {} if live_progress else {"capture_output": True}
+            if live_progress:
+                streams = {"stderr": subprocess.PIPE}
+            else:
+                streams = {"capture_output": True}
             result = self.runner(argv, **streams, text=True, encoding="utf-8",
                                  errors="replace", timeout=self.timeout, shell=False,
                                  cwd=str(cwd) if cwd else None)
@@ -54,13 +97,17 @@ class VulhubDockerRuntime:
 
     @staticmethod
     def _validate_compose(material: TargetMaterial) -> dict:
-        config = copy.deepcopy(material.attributes.get("compose"))
+        config = _resolve_compose_value(copy.deepcopy(material.attributes.get("compose")))
         if not isinstance(config, dict) or not isinstance(config.get("services"), dict) or not config["services"]:
             raise VulhubRuntimeError("Local Vulhub Compose services are missing or invalid")
-        if set(config) - {"version", "services", "networks"}:
+        unsupported_top_level = {
+            key for key in config
+            if key not in {"version", "services", "networks"} and not key.startswith("x-")
+        }
+        if unsupported_top_level:
             raise VulhubRuntimeError("Compose contains unsupported top-level resource declarations")
         allowed_service_fields = {"image", "build", "volumes", "ports", "environment", "command",
-                                  "entrypoint", "healthcheck", "depends_on", "networks", "expose"}
+                                  "entrypoint", "healthcheck", "depends_on", "networks", "expose", "user"}
         networks = config.get("networks", {})
         if not isinstance(networks, dict):
             raise VulhubRuntimeError("Compose networks must be a mapping")
@@ -130,9 +177,84 @@ class VulhubDockerRuntime:
                 if (not context.is_relative_to(material.environment.resolve()) or not context.is_dir()
                         or not dockerfile.is_relative_to(context) or not dockerfile.is_file()):
                     raise VulhubRuntimeError("Compose build context and Dockerfile must stay inside the local target")
-        if "$" in json.dumps(config, ensure_ascii=False):
+        if _has_unresolved_interpolation(config):
             raise VulhubRuntimeError("Compose environment interpolation must be resolved before this local run")
         return config
+
+    def _service_container(self, run: dict, service: str) -> dict | None:
+        listed = self._call([*run["prefix"], "ps", "-a", "-q", service],
+                            cwd=run["target"].environment)
+        ids = [line.strip() for line in listed.splitlines() if line.strip()]
+        if not ids:
+            return None
+        if len(ids) != 1:
+            raise VulhubRuntimeError(f"Expected exactly one container for Compose service {service}")
+        rows = json.loads(self._call(["docker", "inspect", ids[0]]))
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise VulhubRuntimeError(f"Could not inspect Compose service {service}")
+        return rows[0]
+
+    def _service_diagnostics(self, run: dict, service: str, row: dict | None) -> str:
+        details = []
+        if row:
+            container_id = row.get("Id")
+            state = row.get("State", {})
+            details.append(f"state={state.get('Status')} exit_code={state.get('ExitCode')}")
+            health = state.get("Health") or {}
+            for entry in (health.get("Log") or [])[-3:]:
+                output = str(entry.get("Output") or "").strip()
+                if output:
+                    details.append(f"health={output[-1000:]}")
+            if container_id:
+                try:
+                    logs = self._call(["docker", "logs", "--tail", "80", container_id],
+                                      include_stderr=True)
+                except VulhubRuntimeError as exc:
+                    details.append(f"logs_error={exc}")
+                else:
+                    details.append(f"logs=\n{logs[-4000:]}")
+        return "\n".join(details)[-8000:]
+
+    def _wait_for_service(self, run: dict, service: str) -> dict:
+        deadline = time.monotonic() + min(self.timeout, 120)
+        restarts = 0
+        row = None
+        while time.monotonic() < deadline:
+            row = self._service_container(run, service)
+            if row is None:
+                time.sleep(1)
+                continue
+            state = row.get("State", {})
+            if state.get("Running") is True:
+                health = state.get("Health")
+                if not health or health.get("Status") == "healthy":
+                    return row
+            elif state.get("Status") == "exited":
+                if state.get("ExitCode") == 0:
+                    raise VulhubRuntimeError(
+                        f"Network-facing Compose service {service} exited successfully but must remain running"
+                    )
+                if restarts >= 10:
+                    diagnostics = self._service_diagnostics(run, service, row)
+                    raise VulhubRuntimeError(
+                        f"Compose service {service} did not become ready after bounded restarts"
+                        + (f"\n{diagnostics}" if diagnostics else "")
+                    )
+                self._call([*run["prefix"], "start", service], cwd=run["target"].environment)
+                restarts += 1
+                time.sleep(2)
+                continue
+            time.sleep(1)
+        diagnostics = self._service_diagnostics(run, service, row)
+        raise VulhubRuntimeError(
+            f"Compose service {service} did not become ready before the startup deadline"
+            + (f"\n{diagnostics}" if diagnostics else "")
+        )
+
+    def _wait_for_network_services(self, run: dict, config: dict) -> None:
+        for name, service in config["services"].items():
+            if service.get("ports") or service.get("expose"):
+                self._wait_for_service(run, name)
 
     def start(self, *, target: TargetMaterial, run_id: str) -> dict:
         config = self._validate_compose(target)
@@ -165,13 +287,24 @@ class VulhubDockerRuntime:
         prefix = ["docker", "compose", "--project-name", project,
                   "--project-directory", str(target.environment), "--file",
                   str(sanitized_path), "--file", str(override)]
-        with self.compose_progress() if self.compose_progress else nullcontext():
-            self._call([*prefix, "up", "-d", "--wait", "--wait-timeout", "120"],
-                       cwd=target.environment, live_progress=self.compose_progress is not None)
         network_name = f"{project}_vulnforge_internal"
-        self._runs[run_id] = {"project": project, "prefix": prefix, "target": target,
-                              "network_name": network_name, "override": override,
-                              "metasploit_attached": False}
+        run = {"project": project, "prefix": prefix, "target": target,
+               "network_name": network_name, "override": override,
+               "metasploit_attached": False}
+        self._runs[run_id] = run
+        try:
+            with self.compose_progress() if self.compose_progress else nullcontext():
+                self._call([*prefix, "up", "-d"], cwd=target.environment,
+                           live_progress=self.compose_progress is not None)
+            self._wait_for_network_services(run, config)
+        except Exception as exc:
+            try:
+                self.cleanup_target(run_id=run_id)
+            except Exception as cleanup_exc:
+                raise VulhubRuntimeError(f"{exc}; target cleanup also failed: {cleanup_exc}") from exc
+            finally:
+                self._runs.pop(run_id, None)
+            raise
         return {"project": project, "network_name": network_name,
                 "compose_sha256": __import__("hashlib").sha256(
                     json.dumps(config, sort_keys=True).encode()).hexdigest(),
@@ -265,6 +398,7 @@ class VulhubDockerRuntime:
         config = run["target"].attributes["compose"]
         if service not in config["services"]:
             raise VulhubRuntimeError("Planner-selected service is not in the local Compose file")
+        self._wait_for_service(run, service)
         listed = self._call([*run["prefix"], "ps", "-q", service], cwd=run["target"].environment)
         ids = [line.strip() for line in listed.splitlines() if line.strip()]
         if len(ids) != 1:
@@ -302,11 +436,13 @@ class VulhubDockerRuntime:
         callback_host = run.get("metasploit_ip")
         if not callback_host:
             raise VulhubRuntimeError("Metasploit callback address was not resolved")
+        image = json.loads(self._call(["docker", "image", "inspect", row["Image"]]))[0]
         return RuntimeTarget.from_vulhub(target=run["target"], run_id=run_id, service=service,
                                          port=port, host=str(address), callback_host=callback_host,
                                          project=run["project"],
                                          container_id=row.get("Id", ids[0]),
-                                         network_name=run["network_name"], network_id=network.get("NetworkID"))
+                                         network_name=run["network_name"], network_id=network.get("NetworkID"),
+                                         os=image.get("Os"), architecture=image.get("Architecture"))
 
     def inspect_file_artifact(self, *, run_id: str, service: str,
                               path_pattern: str) -> dict:
@@ -316,7 +452,7 @@ class VulhubDockerRuntime:
                 or any(ch in path_pattern for ch in ";|&$`")):
             raise VulhubRuntimeError("Unsafe file artifact pattern")
         root = "/" + path_pattern.lstrip("/").split("/", 1)[0]
-        if root not in {"/opt", "/tmp", "/var", "/home", "/usr/local"}:
+        if root not in {"/opt", "/tmp", "/var", "/home", "/usr/local", "/etc"}:
             raise VulhubRuntimeError("File artifact root is outside the allowed local target paths")
         run = self._runs.get(run_id)
         if not run:
@@ -326,8 +462,8 @@ class VulhubDockerRuntime:
         if len(ids) != 1:
             raise VulhubRuntimeError("Expected exactly one running target service container")
         script = (
-            'root=$1; pattern=$2; '
-            'find "$root" -path "$pattern" -type f -print 2>/dev/null | '
+            'root=$1; pattern=$2; base=${pattern##*/}; '
+            'find "$root" -type f \\( -path "$pattern" -o -name "$base" \\) -print 2>/dev/null | '
             'while IFS= read -r file; do '
             'size=$(stat -c %s "$file" 2>/dev/null || printf 0); '
             'hash=$(sha256sum "$file" 2>/dev/null || printf 0); hash=${hash%% *}; '

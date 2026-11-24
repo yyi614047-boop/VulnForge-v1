@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from app.verification.contracts import FileArtifactExpectation, FrozenModel, VerificationContract
+from app.verification.contracts import DatabaseResultExpectation, FileArtifactExpectation, FrozenModel, HttpExpectation, OobExpectation, StateChangeExpectation, VerificationContract
 
 
 class CommandExpectation(FrozenModel):
@@ -22,6 +22,10 @@ class VerificationPolicy(FrozenModel):
     accepted_rules: tuple[str, ...] = Field(default=(), max_length=10)
     command_expectations: tuple[CommandExpectation, ...] = Field(default=(), max_length=10)
     file_expectations: tuple[FileArtifactExpectation, ...] = Field(default=(), max_length=10)
+    state_expectations: tuple[StateChangeExpectation, ...] = Field(default=(), max_length=10)
+    http_expectations: tuple[HttpExpectation, ...] = Field(default=(), max_length=10)
+    oob_expectations: tuple[OobExpectation, ...] = Field(default=(), max_length=10)
+    database_results: tuple[DatabaseResultExpectation, ...] = Field(default=(), max_length=10)
     policy_id: str = Field(min_length=1, max_length=128)
     unsupported_reason: str | None = None
 

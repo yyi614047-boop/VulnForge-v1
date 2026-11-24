@@ -51,7 +51,9 @@ class EvidenceCollector:
                 "is_success_evidence": False,
             }, raw=execution_ref)
         for row in execution.command_output_evidence:
-            if not isinstance(row, dict) or row.get("source") != "metasploit_rpc_command_output":
+            if not isinstance(row, dict) or row.get("source") not in {
+                "metasploit_rpc_command_output", "script_command_output",
+            }:
                 continue
             if row.get("execution_id") != execution.execution_id or row.get("target_id") != target_id:
                 continue
@@ -62,6 +64,38 @@ class EvidenceCollector:
             if row.get("session_id"):
                 metadata["session_id"] = str(row["session_id"])
             add("metasploit_command_output", "metasploit_rpc_command_output", metadata)
+        for row in execution.http_response_evidence:
+            if not isinstance(row, dict) or row.get("source") != "vulnforge_http_probe":
+                continue
+            if row.get("execution_id") != execution.execution_id or row.get("target_id") != target_id:
+                continue
+            add("http_response", "vulnforge_http_probe", {
+                "execution_id": execution.execution_id,
+                "target_id": target_id,
+                "expectation": row.get("expectation"),
+                "status": row.get("status"),
+                "headers": row.get("headers", []),
+                "body": row.get("body", ""),
+                "body_sha256": row.get("body_sha256"),
+                "truncated": row.get("truncated", False),
+                "error": row.get("error"),
+            })
+        for row in execution.oob_callback_evidence:
+            if not isinstance(row, dict) or row.get("source") != "vulnforge_oob_collector":
+                continue
+            if row.get("execution_id") != execution.execution_id or row.get("target_id") != target_id:
+                continue
+            add("oob_callback", "vulnforge_oob_collector", {
+                "execution_id": execution.execution_id,
+                "target_id": target_id,
+                "target_host": row.get("target_host"),
+                "expectation": row.get("expectation"),
+                "token": row.get("token"),
+                "path": row.get("path"),
+                "method": row.get("method"),
+                "remote_host": row.get("remote_host"),
+                "remote_port": row.get("remote_port"),
+            })
         for row in execution.file_artifact_evidence:
             if not isinstance(row, dict) or row.get("source") != "vulhub_runtime_file_artifact":
                 continue
@@ -74,6 +108,21 @@ class EvidenceCollector:
                 "existed_before": row.get("existed_before"),
                 "exists_after": row.get("exists_after"),
                 "new_files": row.get("new_files", []),
+            })
+        for row in execution.state_change_evidence:
+            if not isinstance(row, dict) or row.get("source") != "metasploit_rpc_state_change":
+                continue
+            if row.get("execution_id") != execution.execution_id or row.get("target_id") != target_id:
+                continue
+            add("metasploit_state_change", "metasploit_rpc_state_change", {
+                "execution_id": execution.execution_id,
+                "target_id": target_id,
+                "job_uuid": execution.job_uuid,
+                "module_name": execution.module_name,
+                "indicator": row.get("indicator"),
+                "before": row.get("before"),
+                "after": row.get("after"),
+                "source_detail": row.get("source_detail", "module.results.state_change"),
             })
         bundle = EvidenceBundle(run_id=execution.run_id, target_id=target_id,
                                 execution_id=execution.execution_id, evidence=tuple(evidence))

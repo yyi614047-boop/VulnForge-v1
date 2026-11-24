@@ -4,7 +4,15 @@ import json
 import re
 
 from app.verification.contracts import VerificationContract
-from app.verification.models import CommandExpectation, FileArtifactExpectation, VerificationPolicy
+from app.verification.models import (
+    CommandExpectation,
+    DatabaseResultExpectation,
+    FileArtifactExpectation,
+    HttpExpectation,
+    OobExpectation,
+    StateChangeExpectation,
+    VerificationPolicy,
+)
 from app.verification.registry import validate_contract
 
 
@@ -12,6 +20,10 @@ def _policy_identity(*, run_id: str, target_id: str, vulnerability_type: str,
                      contract: VerificationContract, accepted_rules: tuple[str, ...],
                      command_expectations: tuple[CommandExpectation, ...],
                      file_expectations: tuple[FileArtifactExpectation, ...],
+                     state_expectations: tuple[StateChangeExpectation, ...],
+                     http_expectations: tuple[HttpExpectation, ...],
+                     oob_expectations: tuple[OobExpectation, ...],
+                     database_results: tuple[DatabaseResultExpectation, ...],
                      unsupported_reason: str | None) -> dict:
     return {
         "run_id": run_id,
@@ -21,6 +33,10 @@ def _policy_identity(*, run_id: str, target_id: str, vulnerability_type: str,
         "accepted_rules": accepted_rules,
         "command_expectations": [item.model_dump(mode="json") for item in command_expectations],
         "file_expectations": [item.model_dump(mode="json") for item in file_expectations],
+        "state_expectations": [item.model_dump(mode="json") for item in state_expectations],
+        "http_expectations": [item.model_dump(mode="json") for item in http_expectations],
+        "oob_expectations": [item.model_dump(mode="json") for item in oob_expectations],
+        "database_results": [item.model_dump(mode="json") for item in database_results],
         "unsupported_reason": unsupported_reason,
     }
 
@@ -41,6 +57,10 @@ def compute_policy_id(policy: VerificationPolicy) -> str:
         accepted_rules=policy.accepted_rules,
         command_expectations=policy.command_expectations,
         file_expectations=policy.file_expectations,
+        state_expectations=policy.state_expectations,
+        http_expectations=policy.http_expectations,
+        oob_expectations=policy.oob_expectations,
+        database_results=policy.database_results,
         unsupported_reason=policy.unsupported_reason,
     ))
 
@@ -52,12 +72,20 @@ def build_verification_policy(*, run_id: str, target_id: str, vulnerability_type
                               command_output_supported: bool = False,
                               command_expectations: tuple[CommandExpectation, ...] = (),
                               file_artifact_supported: bool = False,
-                              file_expectations: tuple[FileArtifactExpectation, ...] = ()) -> VerificationPolicy:
+                              file_expectations: tuple[FileArtifactExpectation, ...] = (),
+                              oob_callback_supported: bool = False) -> VerificationPolicy:
     validate_expectations(command_expectations)
     file_expectations = file_expectations or contract.file_artifacts
+    state_expectations = contract.state_changes
+    http_expectations = contract.http_expectations
+    oob_expectations = contract.oob_expectations
+    database_results = contract.database_results
     reason = validate_contract(vulnerability_type=vulnerability_type, contract=contract)
-    if reason is None and (module_type != "exploit" or not module_name.startswith("exploit/")):
-        reason = "Verification requires a selected Metasploit exploit module."
+    if reason is None and not (
+        (module_type == "exploit" and module_name.startswith("exploit/"))
+        or (module_type == "script" and module_name.startswith("script/python/"))
+    ):
+        reason = "Verification requires a selected exploit module or standalone Python PoC."
     if reason is None:
         for requirement in contract.evidence_requirements:
             if not requirement.required:
@@ -69,6 +97,15 @@ def build_verification_policy(*, run_id: str, target_id: str, vulnerability_type
                     reason = "The selected module cannot provide structured command output."
                 elif not command_expectations:
                     reason = "Command output verification requires a frozen application expectation."
+            elif requirement.kind == "http_response":
+                if not http_expectations:
+                    reason = "HTTP response verification requires a frozen request and response expectation."
+            elif requirement.kind == "oob_callback":
+                if not oob_callback_supported or not oob_expectations:
+                    reason = "OOB callback verification requires a running isolated collector and frozen token."
+            elif requirement.kind == "database_result":
+                if not database_results:
+                    reason = "Database result verification requires a frozen probe and exact result."
             elif requirement.kind == "file_artifact":
                 if not file_artifact_supported:
                     reason = "The selected runtime cannot inspect the required file artifact."
@@ -86,6 +123,10 @@ def build_verification_policy(*, run_id: str, target_id: str, vulnerability_type
         accepted_rules=accepted_rules,
         command_expectations=command_expectations,
         file_expectations=file_expectations,
+        state_expectations=state_expectations,
+        http_expectations=http_expectations,
+        oob_expectations=oob_expectations,
+        database_results=database_results,
         unsupported_reason=reason,
     )
     return VerificationPolicy(
@@ -96,6 +137,10 @@ def build_verification_policy(*, run_id: str, target_id: str, vulnerability_type
         accepted_rules=accepted_rules,
         command_expectations=command_expectations,
         file_expectations=file_expectations,
+        state_expectations=state_expectations,
+        http_expectations=http_expectations,
+        oob_expectations=oob_expectations,
+        database_results=database_results,
         policy_id=_policy_id(identity),
         unsupported_reason=reason,
     )

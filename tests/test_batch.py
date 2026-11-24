@@ -85,15 +85,13 @@ class FakeRunner:
         if self.write_results:
             run_dir = Path(env["VULNFORGE_RUNS_ROOT"]) / f"run_{cve}"
             run_dir.mkdir()
-            status = self.statuses.pop(0) if self.statuses else "success"
-            exit_code = {"success": 0, "execution_failed": 4, "cancelled": 0}[status]
+            status = self.statuses.pop(0) if self.statuses else "completed"
+            exit_code = {"completed": 0, "execution_failed": 4, "cancelled": 0}[status]
             result = {
                 "run_id": run_dir.name,
                 "cve_id": cve,
                 "status": status,
-                "verification_summary": {
-                    "status": "success" if status == "success" else "inconclusive",
-                },
+                "verification_summary": {},
                 "errors": ["mock failure"] if status == "execution_failed" else [],
             }
             (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
@@ -116,24 +114,25 @@ def test_dry_run_lists_targets_without_creating_artifacts(vulhub, tmp_path, caps
                       runner=runner) == 0
     output = capsys.readouterr().out
     assert "CVE-2020-0002" in output and "CVE-2020-0003" in output
-    assert "Dry run only" in output
+    assert "当前仅预演，未执行" in output and "--execute" in output
     assert runner.calls == []
     assert not batch_dir.exists()
 
 
-def test_execute_requires_interactive_authorization(vulhub, tmp_path, monkeypatch, capsys):
+def test_execute_runs_without_interactive_authorization(vulhub, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(batch.sys, "stdin", SimpleNamespace(isatty=lambda: False))
     runner = FakeRunner()
     batch_dir = tmp_path / "batch"
-    assert batch.main(_execute_args(vulhub, batch_dir), runner=runner) == 2
-    assert "interactive terminal" in capsys.readouterr().err
-    assert runner.calls == []
-    assert not batch_dir.exists()
+    assert batch.main(_execute_args(vulhub, batch_dir), runner=runner) == 0
+    output = capsys.readouterr().out
+    assert "交互式终端" not in output
+    assert len(runner.calls) == 2
+    assert batch_dir.exists()
 
 
 def test_execute_continues_after_failure_and_writes_summary(vulhub, tmp_path, monkeypatch):
     monkeypatch.setattr(batch.sys, "stdin", SimpleNamespace(isatty=lambda: True))
-    runner = FakeRunner(["success", "execution_failed"])
+    runner = FakeRunner(["completed", "execution_failed"])
     batch_dir = tmp_path / "batch"
     assert batch.main(_execute_args(vulhub, batch_dir), runner=runner) == 1
     assert len(runner.calls) == 2
@@ -143,15 +142,16 @@ def test_execute_continues_after_failure_and_writes_summary(vulhub, tmp_path, mo
         assert call["env"]["VULNFORGE_RUNS_ROOT"] == str(batch_dir / "runs")
     summary = json.loads((batch_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["completed_count"] == 2 and summary["remaining_count"] == 0
-    assert summary["status_counts"] == {"execution_failed": 1, "success": 1}
+    assert summary["status_counts"] == {"execution_failed": 1, "completed": 1}
     assert [row["status"] for row in csv.DictReader(
         (batch_dir / "summary.csv").read_text(encoding="utf-8-sig").splitlines(),
-    )] == ["success", "execution_failed"]
+    )] == ["completed", "execution_failed"]
+    assert [row["verification_status"] for row in summary["results"]] == ["disabled", "disabled"]
 
 
 def test_stop_on_error_stops_before_next_target(vulhub, tmp_path, monkeypatch):
     monkeypatch.setattr(batch.sys, "stdin", SimpleNamespace(isatty=lambda: True))
-    runner = FakeRunner(["execution_failed", "success"])
+    runner = FakeRunner(["execution_failed", "completed"])
     batch_dir = tmp_path / "batch"
     assert batch.main(_execute_args(vulhub, batch_dir, "--stop-on-error"), runner=runner) == 1
     assert len(runner.calls) == 1
@@ -162,7 +162,7 @@ def test_stop_on_error_stops_before_next_target(vulhub, tmp_path, monkeypatch):
 
 def test_user_cancellation_stops_batch(vulhub, tmp_path, monkeypatch):
     monkeypatch.setattr(batch.sys, "stdin", SimpleNamespace(isatty=lambda: True))
-    runner = FakeRunner(["cancelled", "success"])
+    runner = FakeRunner(["cancelled", "completed"])
     batch_dir = tmp_path / "batch"
     assert batch.main(_execute_args(vulhub, batch_dir), runner=runner) == 130
     assert len(runner.calls) == 1
@@ -210,6 +210,37 @@ def test_requested_cve_must_be_a_runnable_rce_variant(vulhub, capsys):
         "--vulhub-root", str(vulhub), "--cve", "CVE-2020-9999",
     ]) == 2
     captured = capsys.readouterr()
-    assert "Selected RCE CVEs: 0" in captured.out
+    assert "已选择 0 个 RCE CVE" in captured.out
     assert "Skipped:" not in captured.out
-    assert "None of the requested CVEs is a runnable RCE manifest variant." in captured.err
+    assert "指定的 CVE 均不是可运行的 RCE 清单条目" in captured.err
+
+
+def test_batch_help_and_errors_default_to_chinese(capsys):
+    with pytest.raises(SystemExit) as help_exit:
+        batch.build_parser().parse_args(["--help"])
+    assert help_exit.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "用法：" in help_text and "逐个授权并按顺序运行" in help_text
+    assert "show this help message" not in help_text
+
+    with pytest.raises(SystemExit) as error:
+        batch.build_parser().parse_args(["--limit", "0"])
+    assert error.value.code == 2
+    error_text = capsys.readouterr().err
+    assert "参数 --limit：必须至少为 1" in error_text
+
+
+def test_batch_explicit_english_output_is_preserved(vulhub, capsys):
+    assert batch.main(["--vulhub-root", str(vulhub), "--lang", "en"]) == 0
+    output = capsys.readouterr().out
+    assert "Selected RCE CVEs: 2" in output
+    assert "Dry run only. Re-run with --execute" in output
+
+
+def test_batch_explicit_english_help_is_preserved(capsys):
+    with pytest.raises(SystemExit) as help_exit:
+        batch.build_parser("en").parse_args(["--help"])
+    assert help_exit.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "usage:" in help_text
+    assert "Run local Vulhub RCE CVEs sequentially" in help_text
