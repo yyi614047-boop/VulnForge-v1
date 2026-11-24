@@ -4,15 +4,85 @@
 
 给定一个漏洞编号（CVE），VulnForge 将环境准备、任务执行和证据验证串成一次实验。读者可以从报告中的结论回到当时的工具输出，查看判断依据。
 
-## 🚀 最小示例
+## 🚀 最小运行示例
 
-在已安装项目依赖的 Python 3.11+ 环境中，进入项目根目录，运行：
+### 准备
+
+安装 Python 3.11+、Docker 和 Docker Compose，并准备本机 Vulhub 仓库、可用的 Metasploit RPC 容器和模型服务。然后安装项目依赖：
+
+```shell
+python -m pip install -e ".[metasploit]"
+cp .env.example .env
+```
+
+按 `.env.example` 填写本机配置。模型 API 密钥、Metasploit RPC 密码等敏感信息只保存在本机 `.env` 中，不要提交到仓库。下面的 `/path/to/vulhub` 请替换为实际的 Vulhub 根目录。
+
+### 运行一个 CVE
+
+以 ActiveMQ 的 `CVE-2022-41678` 为例：
+
+```shell
+python -m app run --cve CVE-2022-41678 --lang zh
+```
+
+也可以在 `.env` 中设置 `VULNFORGE_VULHUB_ROOT`，直接运行：
+
+```shell
+python -m app run --cve CVE-2022-41678
+```
+
+命令会依次完成环境准备、资料整理、研究、计划、Metasploit 执行、必要的独立 Python PoC 回退，以及证据验证。真正执行漏洞利用前会显示授权信息；只在已授权的本地隔离靶场中继续。
+
+运行结束后，查看终端输出的 `report.md` 和 `result.json` 路径。工具任务完成或创建 Session 不等于复现成功，最终结论以独立采集的证据为准。
+
+### 批量运行 RCE CVE
+
+Batch 入口为 `vulnforge-batch-rce`，也可以直接用 `python -m app.batch` 调用。它从 Vulhub 的 `environments.toml` 中发现标记为 `RCE` 且包含 CVE 的环境，默认只预览，不执行。
+
+先预览将要运行的 CVE：
+
+```shell
+python -m app.batch --vulhub-root /path/to/vulhub --dry-run
+```
+
+只预览一个指定 CVE：
+
+```shell
+python -m app.batch --vulhub-root /path/to/vulhub --cve CVE-2022-41678 --dry-run
+```
+
+确认列表后，添加 `--execute` 逐个运行：
+
+```shell
+python -m app.batch --vulhub-root /path/to/vulhub \
+  --cve CVE-2022-41678 \
+  --execute
+```
+
+每个目标都会单独请求授权，并按顺序执行。如需运行多个 CVE，可重复传入 `--cve`，但每个编号都必须是本机 Vulhub 清单中实际存在且标记为 RCE 的环境。默认在首个目标失败后继续后续目标；如需失败即停止，可添加 `--stop-on-error`；如需限制数量，可添加 `--limit 2`。
+
+如果只想确认 Python 入口和参数可用，不启动容器或执行实验：
 
 ```shell
 python -m app --help
+python -m app.batch --help
 ```
 
-看到 `vulnforge` 的用法和子命令列表，就说明 Python 能加载项目入口。查看帮助无需填写密钥，也不会启动容器或执行实验。
+## 🎯 当前复现重点与能力边界
+
+**当前重点是优先使用 Metasploit 完成本地 Vulhub 复现。** 工作流会优先寻找精确引用目标 CVE 的 exploit 模块，尽量使用模块默认配置，只在缺少必要参数时补充配置，并把技术兼容性判断交给 Metasploit 本身。目标地址、端口和执行授权属于安全边界，不允许模型或脚本任意覆盖。
+
+没有候选模块、模块执行失败或不支持当前目标时，工作流会尝试进入独立 Python PoC 模式。该模式由模型生成完整脚本，经程序静态检查后在隔离容器中执行，并允许有限的“生成 → 运行 → 根据报错修改”循环。它是回退能力，不等价于已经准备好所有漏洞的可靠利用链。
+
+以下情况可能导致复现失败或无法得出结论：
+
+- **模块缺失或不适用**：公开模块未覆盖该 CVE、引用信息不准确、模块与目标版本或运行环境不兼容。
+- **目标状态与文档不一致**：镜像版本、补丁状态、服务配置、启动参数或部署路径不同，导致默认参数与利用前提不成立。
+- **脚本回退失败**：模型未能生成正确利用链，脚本被安全检查拒绝，或请求超时、载荷投递和回连未成功。自动修改次数有限，不保证修复所有问题。
+- **证据采集能力不足**：目标没有产生可识别的命令输出、HTTP 特征、回调、文件或数据库变化。此时结论可能是“证据不足”或“暂不支持验证”，不能直接解释为漏洞不存在。
+- **批次范围有限**：Batch 当前只发现清单中标记为 RCE 的 CVE；未标记、缺少环境文件或重复出现的条目可能被跳过。
+
+遇到失败时，应先看 `failed_stage`、错误列表和 `report.md`，区分计划阻塞、模块执行失败、脚本失败和证据验证失败，再决定是否需要调整本地靶场或人工分析。
 
 ## 🧭 实验流程
 
