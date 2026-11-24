@@ -27,7 +27,7 @@ class EvidenceCollector:
 
         execution_ref = None
         if self.evidence_dir is not None:
-            execution_ref = str((self.evidence_dir / execution.run_id / "execution-result.json").resolve())
+            execution_ref = str((self.evidence_dir / "execution-result.json").resolve())
 
         if execution.rpc_session_snapshot_collected:
             add("metasploit_session_delta", "metasploit_rpc", {
@@ -43,6 +43,7 @@ class EvidenceCollector:
             add("metasploit_job", "metasploit_rpc", {
                 "execution_id": execution.execution_id, "job_id": execution.job_id,
                 "job_uuid": execution.job_uuid, "status": execution.job_status,
+                "is_success_evidence": False,
             }, raw=execution_ref)
         if execution.console_output:
             add("metasploit_console", "metasploit_console", {
@@ -54,14 +55,31 @@ class EvidenceCollector:
                 continue
             if row.get("execution_id") != execution.execution_id or row.get("target_id") != target_id:
                 continue
-            add("metasploit_command_output", "metasploit_rpc_command_output", {
+            metadata = {
                 "execution_id": execution.execution_id, "target_id": target_id,
                 "output": row.get("output", ""), "source_detail": row.get("source_detail", "module result")
+            }
+            if row.get("session_id"):
+                metadata["session_id"] = str(row["session_id"])
+            add("metasploit_command_output", "metasploit_rpc_command_output", metadata)
+        for row in execution.file_artifact_evidence:
+            if not isinstance(row, dict) or row.get("source") != "vulhub_runtime_file_artifact":
+                continue
+            if row.get("execution_id") != execution.execution_id or row.get("target_id") != target_id:
+                continue
+            add("target_file_artifact", "vulhub_runtime_file_artifact", {
+                "execution_id": execution.execution_id,
+                "target_id": target_id,
+                "path_pattern": row.get("path_pattern", ""),
+                "existed_before": row.get("existed_before"),
+                "exists_after": row.get("exists_after"),
+                "new_files": row.get("new_files", []),
             })
         bundle = EvidenceBundle(run_id=execution.run_id, target_id=target_id,
                                 execution_id=execution.execution_id, evidence=tuple(evidence))
         if self.evidence_dir is not None:
-            path = self.evidence_dir / execution.run_id
-            path.mkdir(parents=True, exist_ok=True)
-            (path / "evidence-bundle.json").write_text(bundle.model_dump_json(indent=2), encoding="utf-8")
+            self.evidence_dir.mkdir(parents=True, exist_ok=True)
+            (self.evidence_dir / "evidence-bundle.json").write_text(
+                bundle.model_dump_json(indent=2), encoding="utf-8"
+            )
         return bundle

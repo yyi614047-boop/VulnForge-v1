@@ -49,20 +49,47 @@ def verify_command_output_match(*, policy: VerificationPolicy, evidence: tuple[E
     if not records:
         return RuleResult(rule_name="command_output_match", status="inconclusive",
                           reason="No target-bound command output from the Metasploit execution was collected.")
-    output = "\n".join(str(e.metadata.get("output", "")) for e in records)
-    matched = []
-    for expected in policy.command_expectations:
-        try:
-            found = (expected.pattern in output if expected.match_mode == "literal"
-                     else re.search(expected.pattern, output) is not None)
-        except re.error:
-            found = False
-        if found:
-            matched.append(expected.source)
-    if matched:
+    matched_ids = []
+    session_records = [item for item in evidence
+                       if item.evidence_type == "metasploit_session_delta"
+                       and item.source == "metasploit_rpc"]
+    for record in records:
+        session_id = record.metadata.get("session_id")
+        if session_id:
+            baseline = set()
+            valid_session = False
+            for session_record in session_records:
+                data = session_record.metadata
+                baseline = {str(value) for value in data.get("baseline_session_ids", [])}
+                for session in data.get("sessions_after", []):
+                    if not isinstance(session, dict):
+                        continue
+                    session_type = str(session.get("type", session.get("session_type", ""))).casefold()
+                    host = session.get("target_host") or session.get("session_host")
+                    if (str(session.get("session_id", "")) == str(session_id)
+                            and str(session_id) not in baseline
+                            and session_type in ALLOWED_SESSION_TYPES
+                            and host == data.get("target_host")):
+                        valid_session = True
+                        break
+                if valid_session:
+                    break
+            if not valid_session:
+                continue
+        output = str(record.metadata.get("output", ""))
+        for expected in policy.command_expectations:
+            try:
+                found = (expected.pattern in output if expected.match_mode == "literal"
+                         else re.search(expected.pattern, output) is not None)
+            except re.error:
+                found = False
+            if found:
+                matched_ids.append(record.evidence_id)
+                break
+    if matched_ids:
         return RuleResult(rule_name="command_output_match", status="success",
                           reason="Metasploit command output matched a pre-execution expectation.",
-                          evidence_ids=tuple(e.evidence_id for e in records))
+                          evidence_ids=tuple(dict.fromkeys(matched_ids)))
     return RuleResult(rule_name="command_output_match", status="inconclusive",
                       reason="Collected command output did not match the frozen expectation.",
                       evidence_ids=tuple(e.evidence_id for e in records))

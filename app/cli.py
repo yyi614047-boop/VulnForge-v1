@@ -1,11 +1,13 @@
 """VulnForge command-line entry point."""
 from __future__ import annotations
-import argparse, json, os, re, sys, uuid
+import argparse, json, os, re, sys
 import threading
 from contextlib import contextmanager
 import time
 from datetime import datetime
 from pathlib import Path
+
+from app.runtime.config import ConfigurationError, RunContext
 
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.I)
 STAGES = {"target_preparation": 1, "document": 2, "research": 3, "planner": 4,
@@ -102,9 +104,12 @@ def _display_status(value, lang):
 def _display_vulnerability_type(value, lang):
     if lang == "en":
         return value
-    return {"RCE": "\u8fdc\u7a0b\u4ee3\u7801\u6267\u884c\uff08RCE\uff09",
+    return {"RCE": "远程代码执行（RCE）",
             "SQLi": "SQL \u6ce8\u5165\uff08SQLi\uff09",
+            "File Read": "\u6587\u4ef6\u8bfb\u53d6",
             "File Write": "\u6587\u4ef6\u5199\u5165",
+            "SSRF": "\u670d\u52a1\u7aef\u8bf7\u6c42\u4f2a\u9020\uff08SSRF\uff09",
+            "Auth Bypass": "\u8ba4\u8bc1\u7ed5\u8fc7",
             "Unknown": "\u672a\u77e5"}.get(value, value)
 
 
@@ -112,7 +117,10 @@ def _display_reason(value, lang):
     if lang == "en":
         return value
     return {
-        "At least one pre-approved rule matched trusted evidence.": "\u81f3\u5c11\u4e00\u6761\u9884\u5148\u8bbe\u5b9a\u7684\u9a8c\u8bc1\u89c4\u5219\u4e0e\u53ef\u4fe1\u8bc1\u636e\u5339\u914d\u3002",
+        "At least one required pre-approved rule matched trusted evidence.": "\u81f3\u5c11\u4e00\u6761\u9884\u5148\u8bbe\u5b9a\u7684\u9a8c\u8bc1\u89c4\u5219\u4e0e\u53ef\u4fe1\u8bc1\u636e\u5339\u914d\u3002",
+        "At least one pre-approved rule matched trusted evidence.": "\u81f3\u5c11\u4e00\u6762\u9884\u5148\u6279\u51c6\u89c4\u5219\u5339\u914d\u4e86\u53ef\u4fe1\u8bc1\u636e\u3002",
+        "All required pre-approved rules matched trusted evidence.": "\u6240\u6709\u5fc5\u9700\u7684\u9884\u5148\u6279\u51c6\u89c4\u5219\u90fd\u5339\u914d\u4e86\u53ef\u4fe1\u8bc1\u636e\u3002",
+        "Required evidence rules explicitly failed; no success conclusion was inferred.": "\u5fc5\u9700\u8bc1\u636e\u89c4\u5219\u660e\u786e\u5931\u8d25\uff0c\u56e0\u6b64\u672a\u5224\u5b9a\u4e3a\u6210\u529f\u3002",
         "Evidence does not establish the vulnerability; no success conclusion was inferred.": "\u73b0\u6709\u8bc1\u636e\u5c1a\u4e0d\u8db3\u4ee5\u786e\u8ba4\u6f0f\u6d1e\uff0c\u56e0\u6b64\u672a\u5224\u5b9a\u4e3a\u6210\u529f\u3002",
         "A new supported session was observed on the target.": "\u76ee\u6807\u4e0a\u51fa\u73b0\u4e86\u65b0\u5efa\u7684\u53ef\u63a5\u53d7\u4f1a\u8bdd\u3002",
         "No new supported session was observed on the target.": "\u672a\u5728\u76ee\u6807\u4e0a\u89c2\u5bdf\u5230\u7b26\u5408\u6761\u4ef6\u7684\u65b0\u4f1a\u8bdd\u3002",
@@ -145,6 +153,8 @@ def _event(event, lang, log):
         print(f"{labels[0]}: {plan.get('cve_id')} | {labels[1]}: {target.get('host')}:{target.get('port')} | {labels[2]}: {target.get('service')} | {labels[3]}: {event.get('module_name')} | {labels[4]}: {event.get('verification_policy_id')}")
         print(("Goal: " if lang == "en" else "\u590d\u73b0\u76ee\u6807\uff1a") + str(plan.get("reproduction_goal", "")))
         print(("Verification: " if lang == "en" else "\u9884\u671f\u9a8c\u8bc1\uff1a") + str(plan.get("verification_goal", "")))
+        contract = event.get("verification_contract") or {}
+        print(("Evidence contract: " if lang == "en" else "\u8bc1\u636e\u5951\u7ea6\uff1a") + str(contract.get("evidence_requirements", [])))
         print(("Limitations: " if lang == "en" else "\u4e3b\u8981\u9650\u5236\uff1a") + "; ".join(plan.get("limitations", [])))
         configuration = event.get("configuration", {})
         if configuration:
@@ -167,7 +177,7 @@ def _event(event, lang, log):
         label = "failed" if lang == "en" else "\u5931\u8d25"
         print(f"  {label}: {event.get('error', event.get('errors', 'unknown'))}", file=sys.stderr)
     else:
-        phrases = {"module_search_started": ("Searching Metasploit modules", "\u6b63\u5728\u641c\u7d22 Metasploit \u6a21\u5757"), "module_candidates_found": (f"Candidates: {event.get('module_names', [])}", f"\u5019\u9009\u6a21\u5757\uff1a{event.get('module_names', [])}"), "module_selected": (f"Selected: {event.get('module_name')}", f"\u5df2\u9009\u62e9\uff1a{event.get('module_name')}"), "module_configuration_completed": ("Module configured", "\u6a21\u5757\u914d\u7f6e\u5b8c\u6210"), "exploit_started": ("Exploit started", "\u5f00\u59cb\u6267\u884c"), "exploit_completed": (f"Job status: {event.get('job_status', 'finished')}", f"Job \u72b6\u6001\uff1a{_display_status(event.get('job_status', 'finished'), lang)}"), "session_detected": ("Session detected (not proof of success)", "\u68c0\u6d4b\u5230 Session\uff08\u662f\u5426\u6210\u529f\u4ee5\u6700\u7ec8\u9a8c\u8bc1\u7ed3\u679c\u4e3a\u51c6\uff09"), "execution_failed": (f"Execution failed: {event.get('error', 'unknown')}", f"\u6267\u884c\u5931\u8d25\uff1a{event.get('error', 'unknown')}" )}
+        phrases = {"module_search_started": ("Searching Metasploit modules", "\u6b63\u5728\u641c\u7d22 Metasploit \u6a21\u5757"), "module_candidates_found": (f"Candidates: {event.get('module_names', [])}", f"\u5019\u9009\u6a21\u5757\uff1a{event.get('module_names', [])}"), "module_selected": (f"Selected: {event.get('module_name')}", f"\u5df2\u9009\u62e9\uff1a{event.get('module_name')}"), "module_configuration_completed": ("Module configured", "\u6a21\u5757\u914d\u7f6e\u5b8c\u6210"), "exploit_started": ("Exploit started", "\u5f00\u59cb\u6267\u884c"), "exploit_completed": (f"Job status: {event.get('job_status', 'finished')}", f"Job \u72b6\u6001\uff1a{_display_status(event.get('job_status', 'finished'), lang)}"), "session_detected": ("Session detected (not proof of success)", "\u68c0\u6d4b\u5230 Session\uff08\u662f\u5426\u6210\u529f\u4ee5\u6700\u7ec8\u9a8c\u8bc1\u7ed3\u679c\u4e3a\u51c6\uff09"), "verification_completed": (f"Verification: {event.get('status')} | type: {event.get('result_label')} | matched rules: {event.get('matched_rule_names', [])} | matched evidence: {event.get('matched_evidence_ids', [])}", f"\u9a8c\u8bc1\u72b6\u6001\uff1a{_display_status(event.get('status'), lang)} | \u7ed3\u679c\u7c7b\u578b\uff1a{event.get('result_label')} | \u547d\u4e2d\u89c4\u5219\uff1a{event.get('matched_rule_names', [])} | \u547d\u4e2d\u8bc1\u636e\uff1a{event.get('matched_evidence_ids', [])}"), "execution_failed": (f"Execution failed: {event.get('error', 'unknown')}", f"\u6267\u884c\u5931\u8d25\uff1a{event.get('error', 'unknown')}" )}
         if kind in phrases: print("  " + phrases[kind][lang != "en"])
 
 
@@ -178,14 +188,15 @@ def _report(state, cve, run_time, lang):
     en = lang == "en"
     title = "VulnForge run report" if en else "VulnForge \u8fd0\u884c\u62a5\u544a"
     headings = ("Basic information", "Vulnerability analysis", "Reproduction plan", "Execution", "Verification result", "Summary") if en else ("\u57fa\u672c\u4fe1\u606f", "\u6f0f\u6d1e\u5206\u6790", "\u590d\u73b0\u8ba1\u5212", "\u6267\u884c\u8fc7\u7a0b", "\u9a8c\u8bc1\u7ed3\u679c", "\u603b\u7ed3")
-    f = {"cve": "CVE" if en else "CVE", "time": "Run time" if en else "\u8fd0\u884c\u65f6\u95f4", "target": "Local target" if en else "\u672c\u5730\u76ee\u6807", "status": "Status" if en else "\u72b6\u6001", "category": "Category" if en else "\u6f0f\u6d1e\u7c7b\u522b", "component": "Affected component" if en else "\u53d7\u5f71\u54cd\u7ec4\u4ef6", "mechanism": "Mechanism" if en else "\u6f0f\u6d1e\u673a\u5236", "trigger": "Trigger conditions" if en else "\u89e6\u53d1\u6761\u4ef6", "sources": "Sources / limitations" if en else "\u6765\u6e90\u4e0e\u5c40\u9650", "goal": "Goal" if en else "\u590d\u73b0\u76ee\u6807", "module": "Module" if en else "Metasploit \u6a21\u5757", "service": "Target service" if en else "\u76ee\u6807\u670d\u52a1", "strategy": "Verification strategy" if en else "\u9a8c\u8bc1\u7b56\u7565", "limits": "Limitations" if en else "\u6267\u884c\u9650\u5236", "job": "Job" if en else "Job \u72b6\u6001", "sessions": "Sessions" if en else "Session \u6458\u8981", "errors": "Errors" if en else "\u9519\u8bef", "rules": "Rules" if en else "\u9a8c\u8bc1\u89c4\u5219", "evidence": "Evidence references" if en else "\u8bc1\u636e\u5f15\u7528", "reason": "Reason" if en else "\u7ed3\u8bba\u539f\u56e0"}
+    f = {"cve": "CVE" if en else "CVE", "time": "Run time" if en else "\u8fd0\u884c\u65f6\u95f4", "target": "Local target" if en else "\u672c\u5730\u76ee\u6807", "status": "Status" if en else "\u72b6\u6001", "category": "Category" if en else "\u6f0f\u6d1e\u7c7b\u522b", "component": "Affected component" if en else "\u53d7\u5f71\u54cd\u7ec4\u4ef6", "mechanism": "Mechanism" if en else "\u6f0f\u6d1e\u673a\u5236", "trigger": "Trigger conditions" if en else "\u89e6\u53d1\u6761\u4ef6", "sources": "Sources / limitations" if en else "\u6765\u6e90\u4e0e\u5c40\u9650", "goal": "Goal" if en else "\u590d\u73b0\u76ee\u6807", "module": "Module" if en else "Metasploit \u6a21\u5757", "service": "Target service" if en else "\u76ee\u6807\u670d\u52a1", "strategy": "Verification strategy" if en else "\u9a8c\u8bc1\u7b56\u7565", "limits": "Limitations" if en else "\u6267\u884c\u9650\u5236", "job": "Job" if en else "Job \u72b6\u6001", "sessions": "Sessions" if en else "Session \u6458\u8981", "errors": "Errors" if en else "\u9519\u8bef", "rules": "Matched rules" if en else "\u5b9e\u9645\u547d\u4e2d\u7684\u89c4\u5219", "evidence": "Matched evidence IDs" if en else "\u5b9e\u9645\u547d\u4e2d\u7684\u8bc1\u636e ID", "all_evidence": "All evidence references" if en else "\u5168\u90e8\u8bc1\u636e\u5f15\u7528", "reason": "Reason" if en else "\u7ed3\u8bba\u539f\u56e0", "required": "Required evidence" if en else "\u5fc5\u9700\u8bc1\u636e", "optional": "Optional evidence" if en else "\u53ef\u9009\u8bc1\u636e", "acceptance": "Acceptance policy" if en else "\u7ec4\u5408\u7b56\u7565", "result_label": "Result type" if en else "\u7ed3\u679c\u7c7b\u578b", "missing_optional": "Unavailable optional capabilities" if en else "\u672a\u83b7\u5f97\u7684\u53ef\u9009\u80fd\u529b", "unsupported": "Unsupported reason" if en else "\u4e0d\u652f\u6301\u539f\u56e0", "reproduced": "Vulnerability reproduced" if en else "\u6f0f\u6d1e\u590d\u73b0\u6210\u529f", "shell": "Shell acquired" if en else "\u83b7\u5f97 Shell"}
     unknown = "unknown" if en else "\u4fe1\u606f\u4e0d\u8db3"
     mech = r.get("vulnerability_mechanism") or r.get("vulnerability_summary") or ("Insufficient evidence" if en else "\u8bc1\u636e\u4e0d\u8db3")
     failed_stage_label = "Failed stage" if en else "\u5931\u8d25\u9636\u6bb5"
     rpc_log_label = "Full RPC log" if en else "RPC \u8be6\u7ec6\u65e5\u5fd7"
     status_label = "Status" if en else "\u72b6\u6001"
     not_reached = "Verification not reached" if en else "\u672a\u8fdb\u5165\u9a8c\u8bc1\u9636\u6bb5"
-    report_rules = v.get("rule_results", [])
+    report_rules = [rule for rule in v.get("rule_results", [])
+                    if rule.get("rule_name") in v.get("matched_rule_names", [])]
     if not en:
         report_rules = [
             {**rule, "status": _display_status(rule.get("status"), lang),
@@ -193,6 +204,28 @@ def _report(state, cve, run_time, lang):
             for rule in report_rules
         ]
     report_reason = _display_reason(v.get("reason", not_reached), lang)
+    contract = p.get("verification_contract") or {}
+    requirements = contract.get("evidence_requirements", [])
+    rule_statuses = {rule.get("rule_name"): rule.get("status") for rule in v.get("rule_results", [])}
+    required = [item for item in requirements if item.get("required", True)]
+    optional = [item for item in requirements if not item.get("required", True)]
+    missing_optional = [item for item in optional
+                        if rule_statuses.get(item.get("rule_name")) != "success"
+                        and item.get("rule_name") not in v.get("matched_rule_names", [])]
+    matched_rules = list(v.get("matched_rule_names", []))
+    matched_evidence = list(v.get("matched_evidence_ids", []))
+    all_evidence = [e.get("evidence_id") for e in _summary(state.get("evidence")).get("evidence", [])]
+    result_label = v.get("result_label") or contract.get("result_label") or "unknown"
+    result_labels = {"remote_command_execution": "\u8fdc\u7a0b\u547d\u4ee4\u6267\u884c", "session_access": "\u4f1a\u8bdd\u8bbf\u95ee",
+                     "sql_injection_confirmed": "SQL \u6ce8\u5165\u5df2\u786e\u8ba4", "file_read_confirmed": "\u6587\u4ef6\u8bfb\u53d6\u5df2\u786e\u8ba4",
+                     "file_write_confirmed": "\u6587\u4ef6\u5199\u5165\u5df2\u786e\u8ba4", "ssrf_confirmed": "SSRF \u5df2\u786e\u8ba4",
+                     "auth_bypass_confirmed": "\u8ba4\u8bc1\u7ed5\u8fc7\u5df2\u786e\u8ba4"}
+    display_result_label = result_label if en else result_labels.get(result_label, result_label)
+    unsupported_reason = p.get("unsupported_reason") or (v.get("reason") if v.get("status") == "verification_unsupported" else None) or "none"
+    reproduced = "yes" if v.get("status") == "success" and en else ("\u662f" if v.get("status") == "success" else "\u5426")
+    shell_acquired = "yes" if "session_established" in matched_rules and en else ("\u662f" if "session_established" in matched_rules else "\u5426")
+    none_text = "none" if en else "\u65e0"
+    format_requirement = lambda item: f"{item.get('kind')}/{item.get('rule_name')}: {item.get('description', '')}"
     return _safe(f"""# {title}
 
 ## {headings[0]}
@@ -203,7 +236,7 @@ def _report(state, cve, run_time, lang):
 - {failed_stage_label}: {state.get('failed_stage', '')}
 
 ## {headings[1]}
-- {f['category']}: {_display_vulnerability_type(r.get('vulnerability_type', unknown), lang)}
+- {f['category']}: {_display_vulnerability_type(p.get('vulnerability_type', r.get('vulnerability_type', unknown)), lang)}
 - {f['component']}: {r.get('affected_component') or unknown}
 - {f['mechanism']}: {mech}
 - {f['trigger']}: {r.get('trigger_conditions', unknown)}
@@ -214,6 +247,9 @@ def _report(state, cve, run_time, lang):
 - {f['module']}: {x.get('module_name', 'not selected')}
 - {f['service']}: {runtime.get('service', p.get('target_service', ''))}:{runtime.get('port', '')}
 - {f['strategy']}: {p.get('verification_goal', '')}
+- {f['required']}: {[format_requirement(item) for item in required] or none_text}
+- {f['optional']}: {[format_requirement(item) for item in optional] or none_text}
+- {f['acceptance']}: {contract.get('acceptance_policy', 'any')}
 - {f['limits']}: {'; '.join(p.get('limitations', []))}
 
 ## {headings[3]}
@@ -223,8 +259,14 @@ def _report(state, cve, run_time, lang):
 
 ## {headings[4]}
 - {status_label}: {_display_status(v.get('status', 'not run'), lang)}
+- {f['result_label']}: {display_result_label}
+- {f['reproduced']}: {reproduced}
+- {f['shell']}: {shell_acquired}
 - {f['rules']}: {report_rules}
-- {f['evidence']}: {[e.get('evidence_id') for e in _summary(state.get('evidence')).get('evidence', [])]}
+- {f['evidence']}: {matched_evidence or none_text}
+- {f['all_evidence']}: {all_evidence or none_text}
+- {f['missing_optional']}: {[format_requirement(item) for item in missing_optional] or none_text}
+- {f['unsupported']}: {unsupported_reason}
 - {f['reason']}: {report_reason}
 
 ## {headings[5]}
@@ -235,16 +277,14 @@ def main():
     args = build_parser().parse_args()
     if not CVE_RE.fullmatch(args.cve):
         print("Invalid CVE identifier." if args.lang == "en" else "CVE \u7f16\u53f7\u683c\u5f0f\u65e0\u6548\u3002", file=sys.stderr); return 2
-    from app.runtime.config import ConfigurationError
     from app.targets.vulhub.config import VulhubSettings
     from app.targets.vulhub.loader import TargetError, load_target
     try:
         settings = VulhubSettings.from_environment(); target = load_target(settings.root, args.cve)
         from app.workflow import VulnForgeWorkflow
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        run_id = f"{stamp}_{args.cve.upper()}_{uuid.uuid4().hex[:8]}"
-        run_dir = Path(os.getenv("VULNFORGE_RUNS_ROOT", "runs")) / run_id
-        run_dir.mkdir(parents=True, exist_ok=False)
+        run_context = RunContext.create(args.cve)
+        run_id = run_context.run_id
+        run_dir = run_context.run_dir
     except (ConfigurationError, TargetError) as exc:
         print(str(exc), file=sys.stderr); return 2
     except Exception as exc:
@@ -270,7 +310,9 @@ def main():
                     if stage == "target_preparation":
                         label = "Preparing Docker environment" if args.lang == "en" else "准备 Docker 环境"
                     progress.start(label)
-            workflow = VulnForgeWorkflow.from_environment(event_sink=sink, language=args.lang)
+            workflow = VulnForgeWorkflow.from_environment(
+                run_context=run_context, event_sink=sink, language=args.lang
+            )
             if sys.stdout.isatty() and sys.stderr.isatty() and os.getenv("TERM") != "dumb":
                 @contextmanager
                 def compose_progress():
@@ -306,9 +348,6 @@ def main():
         state.update(status="failed", failed_stage=state.get("failed_stage") or "workflow", errors=[*state.get("errors", []), f"{type(exc).__name__}: {exc}"])
         print(f"Workflow failed: {exc}", file=sys.stderr)
     finally:
-        if sys.stdin.isatty() and _ask("Stop and clean this run's Vulhub target containers? [y/N]: " if args.lang == "en" else "\u662f\u5426\u505c\u6b62\u5e76\u6e05\u7406\u672c\u6b21 Vulhub \u76ee\u6807\u5bb9\u5668\uff1f[y/N]: ") and workflow:
-            try: workflow.target_runtime.cleanup_target(run_id=run_id)
-            except Exception as exc: state.setdefault("errors", []).append(f"Cleanup failed: {exc}")
         v = _summary(state.get("verification_result"))
         try:
             execution = _summary(state.get("execution_result"))
@@ -328,8 +367,8 @@ def main():
             report_path.write_text(_report(state, args.cve.upper(), run_time, args.lang), encoding="utf-8")
             evidence = state.get("evidence")
             if evidence is not None:
-                evidence_dir = run_dir / "evidence"
-                evidence_dir.mkdir(exist_ok=True)
+                evidence_dir = run_context.evidence_dir
+                evidence_dir.mkdir(parents=True, exist_ok=True)
                 (evidence_dir / "evidence-bundle.json").write_text(json.dumps(_safe(_json(evidence)), ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as exc: print(f"Could not write run artifacts in {run_dir}: {exc}", file=sys.stderr)
         print(("Reproduction report: " if args.lang == "en" else "\u590d\u73b0\u62a5\u544a\u8def\u5f84\uff1a") + str((run_dir / "report.md").resolve()))

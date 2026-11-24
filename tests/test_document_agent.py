@@ -5,7 +5,6 @@ import pytest
 
 from app.agents.document import DocumentAgent, DocumentAgentError
 from app.agents.runner import AgentRunner
-from app.runtime.config import ConfigurationError
 from app.targets.material import TargetMaterial
 from app.targets.vulhub.loader import load_target
 
@@ -131,10 +130,3 @@ def test_invalid_model_result_is_rejected(tmp_path):
 
     with pytest.raises(DocumentAgentError, match="model call failed"):
         agent.run(material)
-
-
-def test_missing_model_configuration_fails_before_model_creation(monkeypatch):
-    monkeypatch.delenv("VULNFORGE_MODEL", raising=False)
-
-    with pytest.raises(ConfigurationError, match="VULNFORGE_MODEL"):
-        DocumentAgent.from_environment()

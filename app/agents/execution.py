@@ -4,24 +4,27 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
-import os
 import re
-import ssl
-import subprocess
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
-from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.file_write_profiles import file_write_profile
+from app.agents.metasploit_executor import MetasploitExecutor, MetasploitJobError
+from app.agents.metasploit_rpc import MetasploitRpcError
+from app.agents.module_catalog import MetasploitSearch, ModuleMetadata, ModuleOption
 from app.agents.planner import ReproductionPlan
 from app.agents.runner import AgentRunner
-from app.runtime.config import ConfigurationError
+from app.agents.session_evidence import POSIX_ID_EXPECTATION, SessionEvidenceCollector
 from app.targets.material import TargetMaterial
 from app.verification.models import CommandExpectation, VerificationPolicy
+
+
+class UnsupportedExecutionError(RuntimeError):
+    pass
 
 
 class RuntimeTarget(BaseModel):
@@ -49,7 +52,7 @@ class RuntimeTarget(BaseModel):
         """Bind runtime Docker observations to the selected local Compose service."""
         cve = target.identifier.upper()
         services = target.attributes.get("compose", {}).get("services", {})
-        if service not in services or not isinstance(services[service], dict):
+        if service not in services or not isinstance(services.get(service), dict):
             raise PermissionError("Runtime service is absent from the selected local Vulhub Compose file")
         declared_ports = services[service].get("ports", [])
         allowed_container_ports = set()
@@ -66,16 +69,17 @@ class RuntimeTarget(BaseModel):
             try:
                 if len(parts) == 1 or parts[1].lower() == "tcp":
                     allowed_container_ports.add(int(parts[0]))
-            except ValueError: pass
+            except ValueError:
+                pass
         if port not in allowed_container_ports:
             raise PermissionError("Runtime target port is absent from the selected local Compose service")
         compose_sha256 = hashlib.sha256(
             json.dumps(target.attributes["compose"], sort_keys=True).encode()
         ).hexdigest()
-        return cls(run_id=run_id, cve_id=cve, project=project, service=service,
-                   host=host, callback_host=callback_host or host, port=port, container_id=container_id,
-                   network_name=network_name, network_id=network_id,
-                   compose_sha256=compose_sha256)
+        return cls(run_id=run_id, cve_id=cve, service=service, host=host,
+                   callback_host=callback_host or host, port=port, project=project,
+                   container_id=container_id, network_name=network_name,
+                   network_id=network_id, compose_sha256=compose_sha256)
 
     def validate_local(self, target: TargetMaterial, plan: ReproductionPlan, run_id: str) -> None:
         if self.run_id != run_id or self.cve_id != target.identifier.upper() or plan.cve_id != self.cve_id:
@@ -89,30 +93,9 @@ class RuntimeTarget(BaseModel):
         if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local:
             raise PermissionError("Runtime target must be a private IPv4 endpoint on the local lab network")
         callback_ip = ipaddress.ip_address(self.callback_host)
-        if callback_ip.version != 4 or not callback_ip.is_private or callback_ip.is_loopback or callback_ip.is_link_local:
+        if (callback_ip.version != 4 or not callback_ip.is_private
+                or callback_ip.is_loopback or callback_ip.is_link_local):
             raise PermissionError("Runtime callback must use a private IPv4 endpoint on the local lab network")
-
-
-class ModuleOption(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: str
-    required: bool = False
-    current_value: str | None = None
-    description: str = ""
-
-
-class ModuleMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    module_name: str
-    module_type: Literal["exploit", "auxiliary"]
-    name: str = ""
-    description: str = ""
-    platforms: list[str] = Field(default_factory=list)
-    targets: list[str] = Field(default_factory=list)
-    references: list[str] = Field(default_factory=list)
-    session_capable: bool = False
-    options: list[ModuleOption] = Field(default_factory=list)
-    raw_output: str = ""
 
 
 class ExecutionResult(BaseModel):
@@ -134,6 +117,7 @@ class ExecutionResult(BaseModel):
     rpc_result: dict = Field(default_factory=dict)
     rpc_job_result_collected: bool = False
     command_output_evidence: list[dict] = Field(default_factory=list)
+    file_artifact_evidence: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
     verification_policy: VerificationPolicy | None = None
     console_output: str = ""
@@ -172,278 +156,7 @@ class ExecutionAuthorization(BaseModel):
     approved: bool
 
 
-class MetasploitSearch:
-    """Read-only msfconsole CVE search and module inspection, compatible with v0."""
-    MODULE_RE = re.compile(r"(?:exploit|auxiliary)/[A-Za-z0-9_./-]+")
-    CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.I)
-
-    def __init__(self, *, container: str | None = None, executable: str = "msfconsole",
-                 runner: Callable = subprocess.run, timeout: int = 180):
-        self.container, self.executable, self.runner, self.timeout = container, executable, runner, timeout
-
-    @classmethod
-    def from_env(cls):
-        container = os.getenv("MSF_CONTAINER_NAME", "vulnforge-metasploit").strip()
-        return cls(container=container or "vulnforge-metasploit")
-
-    def _console(self, command: str) -> str:
-        argv = (["docker", "exec", self.container,
-                 "/usr/src/metasploit-framework/msfconsole", "-q", "-x", command]
-                if self.container else [self.executable, "-q", "-x", command])
-        result = self.runner(argv, capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=self.timeout, shell=False)
-        output = ((result.stdout or "") + "\n" + (result.stderr or ""))[-32000:]
-        if result.returncode:
-            raise RuntimeError(f"Metasploit search failed ({result.returncode}): {output[-2000:]}")
-        return output
-
-    def search(self, cve_id: str) -> list[str]:
-        if not self.CVE_RE.fullmatch(cve_id):
-            raise ValueError("Invalid CVE identifier")
-        found = self.MODULE_RE.findall(self._console(f"search cve:{cve_id.upper()}; exit"))
-        return list(dict.fromkeys(x for x in found if all(p not in {"", ".", ".."} for p in x.split("/"))))
-
-    def inspect(self, cve_id: str, module_name: str) -> ModuleMetadata:
-        if not self.MODULE_RE.fullmatch(module_name) or ".." in module_name.split("/"):
-            raise ValueError("Invalid Metasploit module name")
-        raw = self._console(f"info {module_name}; exit")
-        def field(label):
-            m = re.search(rf"^\s*{label}\s*:\s*(.+)$", raw, re.I | re.M)
-            return m.group(1).strip() if m else ""
-        refs = list(dict.fromkeys(re.findall(r"CVE-\d{4}-\d{4,}", raw, re.I)))
-        options = []
-        in_options = False
-        for line in raw.splitlines():
-            if re.match(r"\s*(Basic|Advanced) Options\s*:?", line, re.I):
-                in_options = True
-                continue
-            if in_options and re.match(r"\s*(Description|References|Targets|Payload information)\s*:?", line, re.I):
-                in_options = False
-            if in_options:
-                m = re.match(r"^\s*([A-Z][A-Z0-9_]*)\s+(.*?)\s+(yes|no)\s{2,}(.+)$", line, re.I)
-                if m:
-                    options.append(ModuleOption(name=m.group(1), current_value=m.group(2).strip() or None,
-                                                required=m.group(3).lower() == "yes", description=m.group(4).strip()))
-        return ModuleMetadata(module_name=module_name, module_type=module_name.split("/", 1)[0],
-                              name=field("Name"), description=raw[-12000:], references=refs,
-                              raw_output=raw, options=options,
-                              session_capable=(any(o.name == "PAYLOAD" for o in options)
-                                               or bool(re.search(r"^\s*Payload information\s*:", raw, re.I | re.M))))
-
-
-class MetasploitRpcError(RuntimeError):
-    def __init__(self, message: str, *, method: str, response: dict):
-        super().__init__(message)
-        self.method = method
-        self.response = response
-
-
-class MessagePackTransport:
-    def __init__(self, host="127.0.0.1", port=55553, timeout=60, opener=urlopen):
-        ip = ipaddress.ip_address(host)
-        if not ip.is_loopback:
-            raise ValueError("RPC connection must use loopback")
-        self.host, self.port, self.timeout, self.opener = host, port, timeout, opener
-
-    def call(self, method, *params):
-        import msgpack
-        req = Request(f"http://{self.host}:{self.port}/api/",
-                      data=msgpack.packb([method, *params], use_bin_type=True),
-                      headers={"Content-Type": "binary/message-pack"}, method="POST")
-        try:
-            with self.opener(req, timeout=self.timeout, context=None) as response:
-                result = _rpc_normalize(
-                    msgpack.unpackb(response.read(), raw=False, strict_map_key=False)
-                )
-        except Exception as exc:
-            raise RuntimeError(f"Metasploit RPC transport failed: {exc}") from exc
-        if isinstance(result, dict) and _rpc_field(result, "error"):
-            error = (_rpc_field(result, "error_message") or _rpc_field(result, "error_class")
-                     or _rpc_field(result, "error"))
-            raise MetasploitRpcError(_rpc_text(error), method=method, response=result)
-        return result
-
-
-class DockerExecMessagePackTransport:
-    """Use the legacy loopback RPC endpoint inside the already-running MSF container."""
-    def __init__(self, container: str, port=55553, timeout=60, runner=subprocess.run):
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", container):
-            raise ValueError("Invalid Metasploit container name")
-        self.container, self.port, self.timeout, self.runner = container, port, timeout, runner
-
-    def call(self, method, *params):
-        import base64
-        import msgpack
-        payload = msgpack.packb([method, *params], use_bin_type=True)
-        ruby = ("require 'base64'; require 'net/http'; require 'uri'; "
-                f"u=URI('http://127.0.0.1:{self.port}/api/'); "
-                "r=Net::HTTP::Post.new(u); r['Content-Type']='binary/message-pack'; "
-                "r['Accept']='binary/message-pack'; r.body=STDIN.read; "
-                f"h=Net::HTTP.new(u.host,u.port,nil); h.open_timeout={self.timeout}; "
-                f"h.read_timeout={self.timeout}; x=h.start{{|c|c.request(r)}}; "
-                "STDOUT.write(Base64.strict_encode64(x.body))")
-        try:
-            result = self.runner(["docker", "exec", "-i", self.container, "ruby", "-e", ruby],
-                                 input=payload, capture_output=True, timeout=self.timeout + 5, check=False)
-            if result.returncode:
-                stderr = result.stderr
-                if isinstance(stderr, bytes):
-                    stderr = stderr.decode("utf-8", errors="replace")
-                detail = (stderr or "").strip()[-2000:]
-                suffix = f": {detail}" if detail else " (no stderr output)"
-                raise RuntimeError(
-                    f"Docker Exec RPC command failed with exit code {result.returncode}{suffix}"
-                )
-            raw = result.stdout.decode("ascii") if isinstance(result.stdout, bytes) else result.stdout
-            response = _rpc_normalize(
-                msgpack.unpackb(base64.b64decode(raw), raw=False, strict_map_key=False)
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Metasploit Docker Exec RPC failed: {exc}") from exc
-        if isinstance(response, dict) and _rpc_field(response, "error"):
-            error = (_rpc_field(response, "error_message") or _rpc_field(response, "error_class")
-                     or _rpc_field(response, "error"))
-            raise MetasploitRpcError(_rpc_text(error), method=method, response=response)
-        return response
-
-
-def _rpc_field(mapping: dict, name: str):
-    """Read a MessagePack map field whether its key was decoded as text or bytes."""
-    value = mapping.get(name)
-    return value if value is not None else mapping.get(name.encode("utf-8"))
-
-
-def _rpc_normalize(value):
-    """Decode UTF-8 MessagePack bytes while preserving non-text binary values."""
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value
-    if isinstance(value, dict):
-        return {_rpc_normalize(key): _rpc_normalize(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_rpc_normalize(item) for item in value]
-    return value
-
-
-def _rpc_text(value):
-    """Convert protocol text returned as either bytes or str into str."""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
-
-
-class MetasploitRpc:
-    ALLOWED = {"module.execute", "module.results", "module.compatible_payloads", "job.list", "job.stop", "session.list", "console.create", "console.read", "console.destroy"}
-    def __init__(self, transport, username: str, password: str):
-        if not username or not password:
-            raise ConfigurationError("MSFRPC_USER and MSFRPC_PASS are required")
-        self.transport, self.username, self.password, self.token = transport, username, password, None
-
-    @classmethod
-    def from_env(cls):
-        container = os.getenv("MSF_CONTAINER_NAME", "vulnforge-metasploit").strip()
-        if not container:
-            container = "vulnforge-metasploit"
-        timeout = int(os.getenv("MSFRPC_TIMEOUT", "60"))
-        transport = (DockerExecMessagePackTransport(
-                         container, int(os.getenv("MSFRPC_CONTAINER_PORT", "55553")), timeout=timeout
-                     )
-                     if os.getenv("MSFRPC_TRANSPORT", "docker-exec") == "docker-exec" and container
-                     else MessagePackTransport(os.getenv("MSFRPC_HOST", "127.0.0.1"),
-                                               int(os.getenv("MSFRPC_PORT", "55553")), timeout=timeout))
-        return cls(transport,
-                   os.getenv("MSFRPC_USER", ""), os.getenv("MSFRPC_PASS", ""))
-
-    def call(self, method, *args):
-        if method not in self.ALLOWED:
-            raise PermissionError("RPC method is not exposed")
-        if self.token is None:
-            auth = self.transport.call("auth.login", self.username, self.password)
-            result = _rpc_field(auth, "result") if isinstance(auth, dict) else None
-            token = _rpc_field(auth, "token") if isinstance(auth, dict) else None
-            if _rpc_text(result) != "success" or not token:
-                raise RuntimeError("Metasploit RPC authentication failed")
-            self.token = _rpc_text(token)
-        return self.transport.call(method, self.token, *args)
-
-
-class MetasploitJobError(RuntimeError):
-    def __init__(self, message: str, *, job_id: int, job_uuid: str, rpc_error: MetasploitRpcError):
-        super().__init__(message)
-        self.job_id = job_id
-        self.job_uuid = job_uuid
-        self.rpc_error = rpc_error
-
-
-class MetasploitExecutor:
-    def __init__(self, rpc, *, timeout=120, poll_interval=.2, clock=time.monotonic, sleeper=time.sleep):
-        self.rpc, self.timeout, self.poll_interval = rpc, timeout, poll_interval
-        self.clock, self.sleeper = clock, sleeper
-
-    def snapshot_sessions(self) -> dict:
-        result = self.rpc.call("session.list") or {}
-        if not isinstance(result, dict):
-            raise RuntimeError("Metasploit returned a malformed pre-execution session list")
-        return result
-
-    def compatible_payloads(self, module: ModuleMetadata) -> list[str]:
-        result = self.rpc.call("module.compatible_payloads", module.module_name)
-        payloads = _rpc_field(result, "payloads") if isinstance(result, dict) else None
-        if not isinstance(payloads, list) or any(not isinstance(name, str) for name in payloads):
-            raise RuntimeError("Metasploit returned a malformed compatible payload list")
-        return payloads
-
-    def execute(self, module: ModuleMetadata, options: dict[str, str], *, session_baseline: dict | None = None) -> dict:
-        before = session_baseline if session_baseline is not None else self.snapshot_sessions()
-        ticket = self.rpc.call("module.execute", module.module_type,
-                               module.module_name.split("/", 1)[1], options)
-        job_id_value = _rpc_field(ticket, "job_id") if isinstance(ticket, dict) else None
-        job_uuid_value = _rpc_field(ticket, "uuid") if isinstance(ticket, dict) else None
-        if job_id_value is None or not job_uuid_value:
-            raise RuntimeError(f"Metasploit returned an invalid job ticket: {ticket!r}")
-        job_id, job_uuid = int(job_id_value), _rpc_text(job_uuid_value)
-
-        def job_call(method, *args):
-            try:
-                return self.rpc.call(method, *args)
-            except MetasploitRpcError as exc:
-                raise MetasploitJobError(str(exc), job_id=job_id, job_uuid=job_uuid,
-                                         rpc_error=exc) from exc
-
-        deadline = self.clock() + self.timeout
-        result = None
-        while self.clock() < deadline:
-            result = job_call("module.results", job_uuid)
-            if isinstance(result, dict) and result.get("status") in {"completed", "failed", "errored", "error"}:
-                break
-            self.sleeper(self.poll_interval)
-        else:
-            job_call("job.stop", job_id)
-            stop_deadline = self.clock() + 5
-            while self.clock() < stop_deadline:
-                active = job_call("job.list")
-                if isinstance(active, dict) and str(job_id) not in {str(key) for key in active}:
-                    break
-                self.sleeper(min(self.poll_interval or .1, max(0, stop_deadline - self.clock())))
-            else:
-                raise RuntimeError(f"Metasploit job {job_uuid} could not be confirmed stopped")
-            raise TimeoutError(f"Metasploit job {job_uuid} timed out; stop requested")
-        after = job_call("session.list") or {}
-        evidence = []
-        for sid, value in after.items():
-            if str(sid) not in {str(k) for k in before} and isinstance(value, dict):
-                evidence.append({"session_id": str(sid), **value})
-        return {"job_id": job_id, "job_uuid": job_uuid, "job_status": result.get("status"),
-                "result": result, "session_evidence": evidence,
-                "session_baseline": [str(key) for key in before],
-                "session_after": [{"session_id": str(key), **value} for key, value in after.items()
-                                  if isinstance(value, dict)]}
-
-
 _SELECT_INSTRUCTIONS = """Select one module only from candidate names supplied by the application. Judge applicability only from module metadata and provided target service/prerequisites. Return null if uncertain. Never invent names or configuration values."""
-
 
 _REQUEST_PATH = re.compile(
     r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/[^\s\"']*)\s+HTTP/\d(?:\.\d)?",
@@ -555,8 +268,10 @@ def _select_target_port(*, module: ModuleMetadata, target: TargetMaterial, servi
 class ExecutionAgent:
     def __init__(self, search: MetasploitSearch, executor: MetasploitExecutor,
                  *, runner: AgentRunner | None = None, event_sink: Callable[[dict], None] | None = None,
-                 evidence_dir: Path | None = None):
+                 evidence_dir: Path | None = None,
+                 session_evidence_collector: SessionEvidenceCollector | None = None):
         self.search, self.executor, self.runner = search, executor, runner
+        self.session_evidence_collector = session_evidence_collector or SessionEvidenceCollector(executor.rpc)
         self.event_sink, self.evidence_dir = event_sink or (lambda event: None), evidence_dir
 
     def _event(self, kind, **details):
@@ -568,7 +283,8 @@ class ExecutionAgent:
             authorized: bool = False, options: dict[str, str] | None = None,
             verification_expectations: tuple[CommandExpectation, ...] = (),
             authorization_callback: Callable[[ExecutionAuthorizationRequest], ExecutionAuthorization | None] | None = None,
-            diagnostics_callback: Callable[[], dict] | None = None) -> ExecutionResult:
+            diagnostics_callback: Callable[[], dict] | None = None,
+            file_artifact_inspector: Callable[[str], dict] | None = None) -> ExecutionResult:
         base = dict(run_id=run_id, execution_id=str(uuid.uuid4()),
                     target_id=runtime_target.container_id if runtime_target else f"unresolved:{run_id}",
                     cve_id=plan.cve_id, target=runtime_target.model_dump() if runtime_target else {})
@@ -605,10 +321,8 @@ class ExecutionAgent:
                                                              "prerequisites": plan.prerequisites}), result_schema=_Selection)
                 selection = raw.module_name
             else:
-                # Safe deterministic selection when no analysis runner was injected.
                 selection = next((m.module_name for m in metadata if m.module_type == "exploit"
                                   and plan.cve_id.upper() in {r.upper() for r in m.references}), None)
-            # LLM selections are accepted only by identity from actual search results.
             module = next((m for m in metadata if m.module_name == selection), None)
             if module is None:
                 result = ExecutionResult(**base, status="unsupported", errors=["No applicable searched module was selected."], started_at=started, ended_at=datetime.now(timezone.utc))
@@ -616,9 +330,9 @@ class ExecutionAgent:
                 self._save_evidence(result)
                 return result
             if plan.cve_id.upper() not in {x.upper() for x in module.references}:
-                result = ExecutionResult(**base, status="unsupported", module_name=module.module_name,
+                result = ExecutionResult(**base, module_name=module.module_name,
                                        console_output=module.raw_output, errors=["Candidate does not establish applicability to the requested CVE."],
-                                       started_at=started, ended_at=datetime.now(timezone.utc))
+                                       started_at=started, ended_at=datetime.now(timezone.utc), status="unsupported")
                 self._save_evidence(result)
                 return result
             self._event("module_selected", run_id=run_id, module_name=module.module_name)
@@ -632,7 +346,26 @@ class ExecutionAgent:
                 self._event("runtime_target_resolved", run_id=run_id,
                             runtime_target=runtime_target.model_dump(mode="json"))
             self._event("module_configuration_started", run_id=run_id, module_name=module.module_name)
+            contract = plan.verification_contract
+            if contract is None:
+                raise ValueError("Reproduction plan has no verification contract")
+            file_required = any(
+                requirement.kind == "file_artifact" and requirement.required
+                for requirement in contract.evidence_requirements
+            )
+            file_profile = file_write_profile(module.module_name) if file_required else None
+            if file_required and file_profile is None:
+                raise UnsupportedExecutionError(
+                    "No trusted File Write verification profile is available for the selected module."
+                )
+            if file_required and file_artifact_inspector is None:
+                raise UnsupportedExecutionError("File artifact inspection is unavailable for this run.")
             supplied = dict(options or {})
+            if file_profile is not None:
+                for key, value in file_profile.options.items():
+                    if key in supplied and supplied[key] != value:
+                        raise ValueError(f"File Write verification requires fixed {key}={value}.")
+                    supplied[key] = value
             if "TARGETURI" in supplied:
                 suggestion_evidence = {"status": "explicit", "option": "TARGETURI",
                                        "value": supplied["TARGETURI"]}
@@ -654,11 +387,24 @@ class ExecutionAgent:
                 raise PermissionError("Target options are derived by the execution agent")
             if any(any(ord(ch) < 32 for ch in value) for value in supplied.values()):
                 raise PermissionError("Control-character module options are disabled")
+            command_required = any(
+                requirement.kind == "command_output" and requirement.required
+                for requirement in contract.evidence_requirements
+            )
+            direct_command_output = command_required and "CMD" in known
+            session_command_output = command_required and module.session_capable
+            if command_required and not (direct_command_output or session_command_output):
+                raise UnsupportedExecutionError(
+                    "The selected module cannot provide structured command output."
+                )
             auto_payload = module.session_capable and "PAYLOAD" in known and "PAYLOAD" not in supplied
             effective = supplied.copy()
-            if "RHOSTS" in known: effective["RHOSTS"] = runtime_target.host
-            if "RHOST" in known: effective["RHOST"] = runtime_target.host
-            if "RPORT" in known: effective["RPORT"] = str(runtime_target.port)
+            if "RHOSTS" in known:
+                effective["RHOSTS"] = runtime_target.host
+            if "RHOST" in known:
+                effective["RHOST"] = runtime_target.host
+            if "RPORT" in known:
+                effective["RPORT"] = str(runtime_target.port)
             if "SSL" in known and runtime_target.port == 80:
                 effective["SSL"] = False
             for o in module.options:
@@ -669,25 +415,64 @@ class ExecutionAgent:
                 effective["CVE"] = plan.cve_id.upper()
             if module.session_capable:
                 effective["LHOST"] = runtime_target.callback_host
+            if direct_command_output:
+                if supplied.get("CMD", "id") != "id":
+                    raise ValueError("The command-output contract requires fixed CMD=id.")
+                effective["CMD"] = "id"
             missing = [o.name for o in module.options if o.required and not effective.get(o.name)
                        and not (auto_payload and o.name == "PAYLOAD")]
-            if missing: raise ValueError("Required module options missing: " + ", ".join(missing))
+            if missing:
+                raise ValueError("Required module options missing: " + ", ".join(missing))
             if auto_payload:
-                payload, reason = _select_payload(
-                    module=module, payloads=self.executor.compatible_payloads(module)
-                )
+                payloads = self.executor.compatible_payloads(module)
+                if direct_command_output:
+                    if "cmd/unix/generic" not in payloads:
+                        raise UnsupportedExecutionError(
+                            "The selected module has no compatible cmd/unix/generic payload for command-output evidence."
+                        )
+                    payload, reason = "cmd/unix/generic", "verification_contract"
+                else:
+                    payload, reason = _select_payload(module=module, payloads=payloads)
                 effective["PAYLOAD"] = payload
                 self._event("payload_selected", run_id=run_id, module_name=module.module_name,
                             payload=payload, reason=reason)
-            # Freeze deterministic verification criteria after module selection and before exploit.
+            command_output_supported = bool(
+                (
+                    direct_command_output
+                    and effective.get("CMD") == "id"
+                    and ("PAYLOAD" not in known or effective.get("PAYLOAD") == "cmd/unix/generic")
+                )
+                or (
+                    session_command_output
+                    and module.session_capable
+                    and effective.get("PAYLOAD") != "cmd/unix/generic"
+                )
+            )
+            if command_required and not command_output_supported:
+                raise UnsupportedExecutionError(
+                    "The selected configuration cannot provide structured command output."
+                )
+            command_expectations = (
+                tuple(verification_expectations) or (POSIX_ID_EXPECTATION,)
+            ) if command_output_supported else ()
             from app.verification.policy import build_verification_policy
             verification_policy = build_verification_policy(
                 run_id=run_id, target_id=runtime_target.container_id,
                 vulnerability_type=plan.vulnerability_type,
+                contract=contract,
                 module_type=module.module_type, module_name=module.module_name,
-                session_capable=module.session_capable,
-                command_expectations=verification_expectations,
+                session_capable=(module.session_capable
+                                 and effective.get("PAYLOAD") != "cmd/unix/generic"),
+                command_output_supported=command_output_supported,
+                command_expectations=command_expectations,
+                file_artifact_supported=file_profile is not None,
+                file_expectations=(file_profile.expectation,) if file_profile is not None else (),
             )
+            if verification_policy.unsupported_reason:
+                raise UnsupportedExecutionError(verification_policy.unsupported_reason)
+            self._event("verification_policy_frozen", run_id=run_id,
+                        module_name=module.module_name, policy_id=verification_policy.policy_id,
+                        contract=contract.model_dump(mode="json"))
             session_baseline = self.executor.snapshot_sessions()
             session_baseline_collected = True
             plan_fingerprint = _fingerprint(plan.model_dump(mode="json"))
@@ -717,8 +502,13 @@ class ExecutionAgent:
                     raise PermissionError("Execution authorization is missing, denied or bound to changed inputs")
             elif not authorized:
                 raise PermissionError("Explicit execution authorization is required")
+            file_baseline = None
+            if file_profile is not None:
+                file_baseline = file_artifact_inspector(file_profile.expectation.path_pattern)
+                if not isinstance(file_baseline, dict) or not isinstance(file_baseline.get("matches"), list):
+                    raise RuntimeError("File artifact inspector returned a malformed baseline")
             self._event("module_configuration_completed", run_id=run_id, module_name=module.module_name,
-                        options={k: ("[REDACTED]" if re.search("pass|token|secret", k, re.I) else v) for k,v in effective.items()})
+                        options={k: ("[REDACTED]" if re.search("pass|token|secret", k, re.I) else v) for k, v in effective.items()})
             self._event("exploit_started", run_id=run_id, module_name=module.module_name)
             raw = self.executor.execute(module, effective, session_baseline=session_baseline)
             self._event("exploit_completed", run_id=run_id, module_name=module.module_name,
@@ -729,13 +519,66 @@ class ExecutionAgent:
             if raw["session_evidence"]:
                 self._event("session_detected", run_id=run_id, sessions=raw["session_evidence"])
             rpc_result = raw["result"] if isinstance(raw["result"], dict) else {"value": str(raw["result"])}
-            command_output = rpc_result.get("command_output")
+            command_output, output_source = _extract_command_output(rpc_result)
             command_evidence = ([{"source": "metasploit_rpc_command_output",
                                   "execution_id": base.get("execution_id"),
                                   "target_id": runtime_target.container_id,
-                                  "output": command_output, "source_detail": "module.results"}]
-                                if isinstance(command_output, str) and command_output else [])
+                                  "output": command_output, "source_detail": output_source}]
+                                if command_output else [])
+            session_command_evidence = []
+            command_diagnostics = []
+            if command_required and raw["job_status"] == "completed":
+                session_command_evidence, command_diagnostics = self.session_evidence_collector.collect(
+                    raw["session_evidence"], target_host=runtime_target.host
+                )
+            bound_session_evidence = []
+            for row in session_command_evidence:
+                if not isinstance(row, dict) or not row.get("output"):
+                    continue
+                bound_session_evidence.append({
+                    "source": "metasploit_rpc_command_output",
+                    "execution_id": base.get("execution_id"),
+                    "target_id": runtime_target.container_id,
+                    "output": row["output"],
+                    "source_detail": row.get("source_detail", "session.shell_read"),
+                    "session_id": str(row.get("session_id", "")),
+                })
+            command_evidence.extend(bound_session_evidence)
+            if bound_session_evidence:
+                self._event("command_output_collected", run_id=run_id,
+                            evidence_count=len(bound_session_evidence),
+                            session_ids=[item["session_id"] for item in bound_session_evidence])
+            file_artifact_evidence = []
+            file_diagnostics = []
+            if file_profile is not None and raw["job_status"] == "completed":
+                try:
+                    file_after = file_artifact_inspector(file_profile.expectation.path_pattern)
+                    if not isinstance(file_after, dict) or not isinstance(file_after.get("matches"), list):
+                        raise RuntimeError("File artifact inspector returned a malformed result")
+                    baseline_paths = {item.get("path") for item in file_baseline.get("matches", [])
+                                      if isinstance(item, dict) and item.get("path")}
+                    new_files = [item for item in file_after["matches"]
+                                 if isinstance(item, dict) and item.get("path") not in baseline_paths]
+                    file_artifact_evidence.append({
+                        "source": "vulhub_runtime_file_artifact",
+                        "execution_id": base.get("execution_id"),
+                        "target_id": runtime_target.container_id,
+                        "path_pattern": file_profile.expectation.path_pattern,
+                        "existed_before": bool(baseline_paths),
+                        "exists_after": bool(file_after["matches"]),
+                        "new_files": new_files,
+                    })
+                    if new_files:
+                        self._event("file_artifact_collected", run_id=run_id,
+                                    path_pattern=file_profile.expectation.path_pattern,
+                                    new_file_count=len(new_files))
+                except Exception as exc:
+                    file_diagnostics.append({"error": f"{type(exc).__name__}: {exc}"})
             diagnostics = _collect_diagnostics(diagnostics_callback) if raw["job_status"] != "completed" else {}
+            if command_diagnostics:
+                diagnostics["command_output"] = command_diagnostics
+            if file_diagnostics:
+                diagnostics["file_artifact"] = file_diagnostics
             if diagnostics:
                 self._event("execution_diagnostics", run_id=run_id, diagnostics=diagnostics)
             result = ExecutionResult(**base, module_name=module.module_name,
@@ -745,16 +588,19 @@ class ExecutionAgent:
                                      session_baseline=raw["session_baseline"], session_after=raw["session_after"],
                                      rpc_session_snapshot_collected=True, rpc_result=rpc_result,
                                      rpc_job_result_collected=True, command_output_evidence=command_evidence,
+                                     file_artifact_evidence=file_artifact_evidence,
                                      diagnostics=diagnostics, verification_policy=verification_policy,
                                      console_output=(module.raw_output + "\n\n--- RPC execution result ---\n" +
                                                      json.dumps(raw["result"], ensure_ascii=False)),
-                                      config_parameters={k: ("[REDACTED]" if re.search("pass|token|secret", k, re.I) else str(v)) for k,v in effective.items()},
+                                     config_parameters={k: ("[REDACTED]" if re.search("pass|token|secret", k, re.I) else str(v)) for k, v in effective.items()},
                                      started_at=started, ended_at=datetime.now(timezone.utc),
                                      errors=[] if raw["job_status"] == "completed" else ["Metasploit module job failed."])
         except Exception as exc:
-            self._event("execution_failed", run_id=run_id, module_name=module.module_name if module else None,
+            unsupported = isinstance(exc, UnsupportedExecutionError)
+            self._event("execution_unsupported" if unsupported else "execution_failed",
+                        run_id=run_id, module_name=module.module_name if module else None,
                         error_type=type(exc).__name__, error=str(exc))
-            diagnostics = _collect_diagnostics(diagnostics_callback)
+            diagnostics = {} if unsupported else _collect_diagnostics(diagnostics_callback)
             job_id = job_uuid = None
             rpc_result = {}
             rpc_job_result_collected = False
@@ -770,7 +616,8 @@ class ExecutionAgent:
             if diagnostics:
                 self._event("execution_diagnostics", run_id=run_id, diagnostics=diagnostics)
             result = ExecutionResult(**base, module_name=module.module_name if module else None,
-                                     status="rejected" if isinstance(exc, PermissionError) else "failed",
+                                     status=("unsupported" if unsupported else
+                                             "rejected" if isinstance(exc, PermissionError) else "failed"),
                                      job_id=job_id, job_uuid=job_uuid, rpc_result=rpc_result,
                                      rpc_job_result_collected=rpc_job_result_collected,
                                      diagnostics=diagnostics, verification_policy=verification_policy,
@@ -784,7 +631,7 @@ class ExecutionAgent:
     def _save_evidence(self, result: ExecutionResult):
         if self.evidence_dir is None:
             return
-        path = self.evidence_dir / result.run_id
+        path = self.evidence_dir
         path.mkdir(parents=True, exist_ok=True)
         output = path / "execution-result.json"
         output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
@@ -798,6 +645,17 @@ def _collect_diagnostics(callback: Callable[[], dict] | None) -> dict:
         return dict(diagnostics) if isinstance(diagnostics, dict) else {}
     except Exception as exc:
         return {"diagnostics_error": f"{type(exc).__name__}: {exc}"}
+
+
+def _extract_command_output(result: dict) -> tuple[str, str]:
+    candidates = [("command_output", result.get("command_output"))]
+    nested = result.get("result")
+    if isinstance(nested, dict):
+        candidates.append(("result.command_output", nested.get("command_output")))
+    for path, value in candidates:
+        if isinstance(value, str) and value:
+            return value, f"module.results.{path}"
+    return "", "module.results"
 
 
 def _fingerprint(value) -> str:

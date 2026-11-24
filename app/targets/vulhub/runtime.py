@@ -308,6 +308,45 @@ class VulhubDockerRuntime:
                                          container_id=row.get("Id", ids[0]),
                                          network_name=run["network_name"], network_id=network.get("NetworkID"))
 
+    def inspect_file_artifact(self, *, run_id: str, service: str,
+                              path_pattern: str) -> dict:
+        if (not isinstance(path_pattern, str) or not path_pattern.startswith("/")
+                or len(path_pattern) > 500 or ".." in path_pattern.split("/")
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in path_pattern)
+                or any(ch in path_pattern for ch in ";|&$`")):
+            raise VulhubRuntimeError("Unsafe file artifact pattern")
+        root = "/" + path_pattern.lstrip("/").split("/", 1)[0]
+        if root not in {"/opt", "/tmp", "/var", "/home", "/usr/local"}:
+            raise VulhubRuntimeError("File artifact root is outside the allowed local target paths")
+        run = self._runs.get(run_id)
+        if not run:
+            raise VulhubRuntimeError("Target runtime is not active for this run")
+        listed = self._call([*run["prefix"], "ps", "-q", service], cwd=run["target"].environment)
+        ids = [line.strip() for line in listed.splitlines() if line.strip()]
+        if len(ids) != 1:
+            raise VulhubRuntimeError("Expected exactly one running target service container")
+        script = (
+            'root=$1; pattern=$2; '
+            'find "$root" -path "$pattern" -type f -print 2>/dev/null | '
+            'while IFS= read -r file; do '
+            'size=$(stat -c %s "$file" 2>/dev/null || printf 0); '
+            'hash=$(sha256sum "$file" 2>/dev/null || printf 0); hash=${hash%% *}; '
+            'printf "%s\\t%s\\t%s\\n" "$file" "$size" "$hash"; done'
+        )
+        output = self._call(["docker", "exec", ids[0], "sh", "-c", script, "sh", root, path_pattern])
+        matches = []
+        for line in output.splitlines()[-200:]:
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            path, size, digest = parts
+            matches.append({
+                "path": path,
+                "size": int(size) if size.isdigit() else None,
+                "sha256": digest if re.fullmatch(r"[0-9a-f]{64}", digest) else None,
+            })
+        return {"path_pattern": path_pattern, "matches": matches}
+
     def collect_target_logs(self, *, run_id: str, service: str, tail: int = 80) -> dict:
         run = self._runs.get(run_id)
         if not run:

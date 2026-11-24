@@ -2,17 +2,32 @@ from pathlib import Path
 
 import pytest
 
-from app.agents.execution import (ExecutionAuthorization, ExecutionAuthorizationRequest,
-                                  ExecutionResult, RuntimeTarget)
+from app.agents.execution import (POSIX_ID_EXPECTATION, ExecutionAuthorization,
+                                  ExecutionAuthorizationRequest, ExecutionResult, RuntimeTarget)
 from app.agents.planner import ReproductionPlan
 from app.agents.research import ResearchResult
+from app.runtime.config import RunContext
 from app.targets.material import TargetMaterial
+import app.workflow as workflow_module
 from app.workflow import VulnForgeWorkflow
 from app.targets.vulhub.runtime import VulhubDockerRuntime, VulhubRuntimeError
-from app.verification.models import VerificationPolicy
+from app.verification.contracts import EvidenceRequirement, VerificationContract
 from app.verification.policy import build_verification_policy
 
 CVE = "CVE-2017-5638"
+SESSION_CONTRACT = VerificationContract(
+    evidence_requirements=(EvidenceRequirement(
+        kind="session", rule_name="session_established", description="A new shell session is observed.",
+    ),),
+    result_label="session_access",
+)
+COMMAND_CONTRACT = VerificationContract(
+    evidence_requirements=(EvidenceRequirement(
+        kind="command_output", rule_name="command_output_match",
+        description="Target-bound output matches the fixed POSIX id expectation.",
+    ),),
+    result_label="remote_command_execution",
+)
 
 
 def setup_vulhub(root):
@@ -23,11 +38,12 @@ def setup_vulhub(root):
     return root
 
 
-def make_plan(research):
+def make_plan(research, contract=None):
     return ReproductionPlan(cve_id=CVE, vulnerability_type=research.vulnerability_type,
                             reproduction_goal="test", target_service="web", prerequisites=[],
                             execution_guidance="Metasploit", verification_goal="RCE evidence",
-                            limitations=[], research_context=research, status="ready")
+                            limitations=[], research_context=research,
+                            verification_contract=contract or SESSION_CONTRACT, status="ready")
 
 
 class FakeRuntime:
@@ -50,8 +66,11 @@ class FakeRuntime:
                                          network_name="run_internal", network_id="b" * 64)
     def restore_metasploit(self, *, run_id):
         self.calls.append(("restore_metasploit", run_id))
+        if self.fail == "restore": raise RuntimeError("network restore failed")
     def cleanup_target(self, *, run_id):
         self.calls.append(("cleanup_target", run_id))
+        if self.fail == "cleanup": raise RuntimeError("target cleanup failed")
+        return {"cleaned": True}
 
 
 class FakeDocument:
@@ -83,16 +102,24 @@ class FakeExecution:
         self.mode, self.session_capable, self.calls = mode, session_capable, 0
     def run(self, *, plan, target, runtime_target=None, run_id, authorized,
             target_resolver=None, authorization_callback, verification_expectations=(),
-            diagnostics_callback=None):
+            diagnostics_callback=None, file_artifact_inspector=None):
         self.calls += 1
         if runtime_target is None:
             runtime_target = target_resolver(80)
         module = "exploit/multi/http/example"
+        command_required = any(
+            item.kind == "command_output" and item.required
+            for item in plan.verification_contract.evidence_requirements
+        )
         policy = build_verification_policy(run_id=run_id, target_id=runtime_target.container_id,
                                            vulnerability_type=plan.vulnerability_type,
+                                           contract=plan.verification_contract,
                                            module_type="exploit", module_name=module,
                                            session_capable=self.session_capable,
-                                           command_expectations=verification_expectations)
+                                           command_output_supported=command_required,
+                                           command_expectations=(
+                                               tuple(verification_expectations) or (POSIX_ID_EXPECTATION,)
+                                           ) if command_required else ())
         request = ExecutionAuthorizationRequest(run_id=run_id, target_id=runtime_target.container_id,
                                                 target_fingerprint="target-fp", plan_fingerprint="plan-fp",
                                                 module_name=module, module_fingerprint="module-fp",
@@ -105,7 +132,7 @@ class FakeExecution:
         sessions = ([{"session_id": "4", "type": "shell", "target_host": runtime_target.host,
                       "via_exploit": "multi/http/example", "exploit_uuid": "job-1"}]
                     if self.mode == "success" else [])
-        return ExecutionResult(run_id=run_id, target_id=runtime_target.container_id,
+        return ExecutionResult(run_id=run_id, execution_id="exec-1", target_id=runtime_target.container_id,
                                cve_id=plan.cve_id, module_name=module, target=runtime_target.model_dump(),
                                status=status, job_id=1 if status == "completed" else None,
                                job_uuid="job-1" if status == "completed" else None,
@@ -114,6 +141,11 @@ class FakeExecution:
                                rpc_session_snapshot_collected=status == "completed",
                                rpc_job_result_collected=status == "completed",
                                verification_policy=policy,
+                               command_output_evidence=([{
+                                   "source": "metasploit_rpc_command_output", "execution_id": "exec-1",
+                                   "target_id": runtime_target.container_id,
+                                   "output": "uid=0(root) gid=0(root) groups=0(root)",
+                               }] if self.mode == "command_success" else []),
                                errors=["mock execution failed"] if status == "failed" else [])
 
 
@@ -154,9 +186,18 @@ def test_normal_graph_state_events_authorization_and_success(tmp_path):
     assert state["verification_result"].status == "success"
     kinds = [x["type"] for x in events]
     assert "stage_started" in kinds and "execution_authorization_requested" in kinds
-    assert "verification_started" in kinds and "workflow_completed" in kinds
+    assert "verification_started" in kinds and "verification_completed" in kinds and "workflow_completed" in kinds
+    authorization = next(event for event in events if event["type"] == "execution_authorization_requested")
+    assert authorization["verification_contract"] == SESSION_CONTRACT.model_dump(mode="json")
+    verification = next(event for event in events if event["type"] == "verification_completed")
+    assert verification["result_label"] == "session_access"
+    assert verification["matched_rule_names"] == ("session_established",)
+    assert verification["matched_evidence_ids"]
     assert execution.calls == 1
-    assert runtime.calls[-1] == ("restore_metasploit", "run123456")
+    assert runtime.calls[-2:] == [
+        ("restore_metasploit", "run123456"),
+        ("cleanup_target", "run123456"),
+    ]
 
 
 def test_target_preparation_failure_terminates(tmp_path):
@@ -165,6 +206,7 @@ def test_target_preparation_failure_terminates(tmp_path):
     state = make_workflow(tmp_path, docker=runtime, document=document).run(CVE, authorization_callback=authorize)
     assert state["status"] == "failed" and state["failed_stage"] == "target_preparation"
     assert document.calls == 0
+    assert ("cleanup_target", state["run_id"]) in runtime.calls
 
 
 def test_document_and_research_failures_stop_later_nodes(tmp_path):
@@ -184,6 +226,41 @@ def test_unexecutable_plan_stops_before_metaspploit(tmp_path):
     assert state["status"] == "plan_blocked" and execution.calls == 0
 
 
+def test_command_contract_reaches_verification_without_session(tmp_path):
+    plan = make_plan(research_result(), COMMAND_CONTRACT)
+    execution = FakeExecution("command_success", session_capable=False)
+    events = []
+    state = make_workflow(tmp_path, planner=FakePlanner(plan), execution=execution,
+                          events=events).run(CVE, authorization_callback=authorize)
+    assert state["status"] == "success"
+    assert state["execution_result"].session_after == []
+    assert state["verification_policy"].contract == COMMAND_CONTRACT
+    assert state["verification_result"].result_label == "remote_command_execution"
+    assert state["verification_result"].matched_rule_names == ("command_output_match",)
+    verification = next(event for event in events if event["type"] == "verification_completed")
+    assert verification["verification_contract"] == COMMAND_CONTRACT.model_dump(mode="json")
+    assert verification["matched_evidence_ids"]
+
+
+def test_unsupported_plan_does_not_enter_execution(tmp_path):
+    research = research_result("SQLi")
+    contract = VerificationContract(
+        evidence_requirements=(EvidenceRequirement(
+            kind="database_result", rule_name="database_result_observed",
+            description="A database result is observed.",
+        ),),
+        result_label="sql_injection_confirmed",
+    )
+    plan = make_plan(research, contract).model_copy(update={
+        "status": "unsupported", "unsupported_reason": "No trusted database result collector is implemented.",
+    })
+    execution = FakeExecution()
+    state = make_workflow(tmp_path, research=FakeResearch(result=research),
+                          planner=FakePlanner(plan), execution=execution).run(CVE)
+    assert state["status"] == "unsupported"
+    assert execution.calls == 0
+
+
 def test_missing_module_is_distinct_unsupported_and_stops_verification(tmp_path):
     execution = FakeExecution("module_unsupported")
     state = make_workflow(tmp_path, execution=execution).run(CVE, authorization_callback=authorize)
@@ -200,7 +277,8 @@ def test_unsupported_verification_policy_is_distinct_from_module_support(tmp_pat
 
 @pytest.mark.parametrize("callback", [None, lambda request: None,
                                        lambda request: ExecutionAuthorization(**request.model_dump(), approved=False),
-                                       lambda request: ExecutionAuthorization(**{**request.model_dump(), "run_id": "other"}, approved=True)])
+                                       lambda request: ExecutionAuthorization(**{**request.model_dump(), "run_id": "other"}, approved=True),
+                                       lambda request: ExecutionAuthorization(**{**request.model_dump(), "verification_policy_id": "stale-policy"}, approved=True)])
 def test_missing_denied_or_mismatched_authorization_never_executes(tmp_path, callback):
     execution = FakeExecution()
     state = make_workflow(tmp_path, execution=execution).run(CVE, authorization_callback=callback)
@@ -225,16 +303,53 @@ def test_inconclusive_execution_keeps_evidence_and_does_not_retry_or_replan(tmp_
     assert execution.calls == planner.calls == 1
 
 
-def test_cleanup_is_scoped_and_target_cleanup_is_caller_controlled(tmp_path):
+def test_cleanup_runs_automatically_for_the_current_run(tmp_path):
     runtime = FakeRuntime()
     state = make_workflow(tmp_path, docker=runtime).run(CVE, authorization_callback=authorize)
-    assert ("restore_metasploit", state["run_id"]) in runtime.calls
-    assert not any(call[0] == "cleanup_target" for call in runtime.calls)
-    runtime2 = FakeRuntime()
-    make_workflow(tmp_path / "second", docker=runtime2).run(CVE, authorization_callback=authorize,
-                                                           cleanup_target=True)
-    assert ("cleanup_target", "") not in runtime2.calls
-    assert runtime2.calls[-1][0] == "cleanup_target"
+    assert runtime.calls[-2:] == [
+        ("restore_metasploit", state["run_id"]),
+        ("cleanup_target", state["run_id"]),
+    ]
+
+
+def test_cleanup_runs_after_keyboard_interrupt(tmp_path):
+    runtime = FakeRuntime()
+    document = FakeDocument()
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+    document.run = interrupt
+    state = make_workflow(tmp_path, docker=runtime, document=document).run(CVE)
+    assert state["status"] == "cancelled" and state["failed_stage"] == "user_cancelled"
+    assert runtime.calls[-1] == ("cleanup_target", state["run_id"])
+
+
+def test_cleanup_failure_is_reported_without_skipping_target_cleanup(tmp_path):
+    runtime = FakeRuntime(fail="restore")
+    state = make_workflow(tmp_path, docker=runtime).run(CVE, authorization_callback=authorize)
+    assert state["status"] == "failed"
+    assert runtime.calls[-1] == ("cleanup_target", state["run_id"])
+    assert any("Metasploit network restore" in error for error in state["errors"])
+
+
+def test_environment_assembly_creates_one_shared_model(monkeypatch, tmp_path):
+    vulhub = tmp_path / "vulhub"
+    vulhub.mkdir()
+    monkeypatch.setenv("VULNFORGE_VULHUB_ROOT", str(vulhub))
+    monkeypatch.setenv("VULNFORGE_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("MSFRPC_USER", "msf")
+    monkeypatch.setenv("MSFRPC_PASS", "test-password")
+    context = RunContext.create(CVE)
+    created = []
+    monkeypatch.setattr(workflow_module, "create_model",
+                        lambda settings: created.append(settings) or object())
+    workflow = VulnForgeWorkflow.from_environment(run_context=context)
+    assert len(created) == 1
+    assert workflow.document_agent.runner is workflow.research_agent.runner
+    assert workflow.research_agent.runner is workflow.planner_agent.runner
+    assert workflow.planner_agent.runner is workflow.execution_agent.runner
+    assert workflow.run_context is context
+    assert workflow.evidence_collector.evidence_dir == context.evidence_dir
+    assert workflow.target_runtime.workspace == context.targets_dir.resolve()
 
 
 def test_docker_runtime_starts_isolated_project_and_restores_only_metasploit_network(tmp_path):

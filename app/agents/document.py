@@ -8,8 +8,6 @@ import re
 from urllib.parse import unquote, urlsplit
 
 from app.agents.runner import AgentRunner
-from app.runtime.config import Settings
-from app.runtime.model import create_model
 from app.targets.material import TargetMaterial
 
 
@@ -46,11 +44,6 @@ class DocumentAgent:
         self.runner = runner
         self.max_images = max_images
         self.max_image_bytes = max_image_bytes
-
-    @classmethod
-    def from_environment(cls) -> "DocumentAgent":
-        settings = Settings.from_environment()
-        return cls(AgentRunner(create_model(settings)))
 
     def run(self, material: TargetMaterial, *, language: str = "zh") -> str:
         if language not in {"zh", "en"}:

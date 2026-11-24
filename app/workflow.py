@@ -12,12 +12,14 @@ from langgraph.graph import END, START, StateGraph
 
 from app.agents.document import DocumentAgent
 from app.agents.execution import (ExecutionAgent, ExecutionAuthorization,
-                                  ExecutionAuthorizationRequest, MetasploitExecutor,
-                                  MetasploitRpc, MetasploitSearch)
+                                  ExecutionAuthorizationRequest)
+from app.agents.metasploit_executor import MetasploitExecutor
+from app.agents.metasploit_rpc import MetasploitRpc
+from app.agents.module_catalog import MetasploitSearch
 from app.agents.planner import PlannerAgent
 from app.agents.research import ResearchAgent
 from app.agents.runner import AgentRunner
-from app.runtime.config import ConfigurationError, Settings
+from app.runtime.config import RunContext, Settings
 from app.runtime.model import create_model
 from app.state import PipelineState
 from app.targets.material import TargetMaterial
@@ -40,7 +42,8 @@ class VulnForgeWorkflow:
     def __init__(self, *, target_root: Path, target_runtime, document_agent,
                  research_agent, planner_agent, execution_agent,
                  evidence_collector=None, verification_engine=None,
-                 event_sink: EventSink | None = None, language: str = "zh"):
+                 event_sink: EventSink | None = None, language: str = "zh",
+                 run_context: RunContext | None = None):
         if language not in {"zh", "en"}:
             raise ValueError("language must be 'zh' or 'en'")
         self.target_root = target_root.resolve()
@@ -49,47 +52,49 @@ class VulnForgeWorkflow:
         self.research_agent = research_agent
         self.planner_agent = planner_agent
         self.execution_agent = execution_agent
-        self.evidence_collector = evidence_collector or EvidenceCollector()
+        self.run_context = run_context
+        self.evidence_collector = evidence_collector or EvidenceCollector(
+            run_context.evidence_dir if run_context else None
+        )
         self.verification_engine = verification_engine or VerificationEngine()
         self.event_sink = event_sink or (lambda event: None)
         self.language = language
-        self._cleanup_target = False
         self._authorization_callback = None
         self._verification_expectations = ()
         self._run_lock = RLock()
         self.graph = self._compile()
 
     @classmethod
-    def from_environment(cls, *, event_sink=None, language="zh"):
+    def from_environment(cls, *, run_context: RunContext, event_sink=None, language="zh"):
         vulhub = VulhubSettings.from_environment()
         settings = Settings.from_environment()
-        runner_model = create_model(settings)
+        runner = AgentRunner(create_model(settings))
         container = os.getenv("MSF_CONTAINER_NAME", "vulnforge-metasploit").strip()
         if not container:
             container = "vulnforge-metasploit"
-        workspace = Path(os.getenv("VULNFORGE_RUNS_ROOT", ".vulnforge-runs"))
         sink = event_sink or (lambda event: None)
         execution = ExecutionAgent(
             MetasploitSearch.from_env(),
             MetasploitExecutor(MetasploitRpc.from_env()),
-            runner=AgentRunner(runner_model),
+            runner=runner,
             event_sink=sink,
-            evidence_dir=workspace / "evidence",
+            evidence_dir=run_context.evidence_dir,
         )
         return cls(
             target_root=vulhub.root,
             target_runtime=VulhubDockerRuntime(
-                workspace / "targets", metasploit_container=container,
+                run_context.targets_dir, metasploit_container=container,
                 rpc_user=os.getenv("MSFRPC_USER", "msf"),
                 rpc_password=os.getenv("MSFRPC_PASS", ""),
                 rpc_port=int(os.getenv("MSFRPC_CONTAINER_PORT", "55553")),
             ),
-            document_agent=DocumentAgent.from_environment(),
-            research_agent=ResearchAgent.from_environment(),
-            planner_agent=PlannerAgent.from_environment(),
+            document_agent=DocumentAgent(runner),
+            research_agent=ResearchAgent(runner),
+            planner_agent=PlannerAgent(runner),
             execution_agent=execution,
-            evidence_collector=EvidenceCollector(workspace / "evidence"),
+            evidence_collector=EvidenceCollector(run_context.evidence_dir),
             event_sink=sink, language=language,
+            run_context=run_context,
         )
 
     def _event(self, kind: str, **fields):
@@ -126,7 +131,7 @@ class VulnForgeWorkflow:
 
     @staticmethod
     def _next(state: PipelineState, next_node: str):
-        return next_node if state.get("status") == "running" else "resource_cleanup"
+        return next_node if state.get("status") == "running" else END
 
     def _compile(self):
         graph = StateGraph(PipelineState)
@@ -175,6 +180,8 @@ class VulnForgeWorkflow:
                             target_id=request.target_id, module_name=request.module_name,
                             configuration=request.configuration_summary,
                             verification_policy_id=request.verification_policy_id,
+                            verification_contract=(plan.verification_contract.model_dump(mode="json")
+                                                   if plan.verification_contract else None),
                             runtime_target=runtime_target.model_dump(mode="json") if runtime_target else {},
                             reproduction_plan=plan.model_dump(mode="json"))
                 callback = self._authorization_callback
@@ -202,6 +209,11 @@ class VulnForgeWorkflow:
                 run_id=run_id, authorized=False, authorization_callback=authorize,
                 verification_expectations=self._verification_expectations,
                 diagnostics_callback=collect_diagnostics,
+                file_artifact_inspector=(
+                    lambda pattern: self.target_runtime.inspect_file_artifact(
+                        run_id=run_id, service=plan.target_service, path_pattern=pattern
+                    )
+                ) if hasattr(self.target_runtime, "inspect_file_artifact") else None,
             )
             runtime_target = runtime_state.get("target")
             state_runtime = (runtime_target.model_dump(mode="json")
@@ -222,33 +234,18 @@ class VulnForgeWorkflow:
         def evidence_and_verify(state):
             bundle = self.evidence_collector.collect(state["execution_result"])
             self._event("verification_started", run_id=state["run_id"],
-                        policy_id=state["verification_policy"].policy_id)
+                        policy_id=state["verification_policy"].policy_id,
+                        verification_contract=state["verification_policy"].contract.model_dump(mode="json"))
             result = self.verification_engine.verify(policy=state["verification_policy"],
                                                       execution=state["execution_result"],
                                                       evidence=bundle)
-            self._event("verification_completed", run_id=state["run_id"], status=result.status)
+            self._event("verification_completed", run_id=state["run_id"], status=result.status,
+                        verification_contract=state["verification_policy"].contract.model_dump(mode="json"),
+                        result_label=result.result_label,
+                        matched_rule_names=result.matched_rule_names,
+                        matched_evidence_ids=result.matched_evidence_ids,
+                        rule_results=[item.model_dump(mode="json") for item in result.rule_results])
             return {"evidence": bundle, "verification_result": result, "status": result.status}
-
-        def cleanup(state):
-            run_id = state["run_id"]
-            cleanup_errors = []
-            try:
-                self.target_runtime.restore_metasploit(run_id=run_id)
-            except Exception as exc:
-                cleanup_errors.append(f"Metasploit network restore: {type(exc).__name__}: {exc}")
-            if self._cleanup_target:
-                try:
-                    self.target_runtime.cleanup_target(run_id=run_id)
-                except Exception as exc:
-                    cleanup_errors.append(f"Vulhub target cleanup: {type(exc).__name__}: {exc}")
-            if cleanup_errors:
-                status = state.get("status", "failed")
-                self._event("resource_cleanup_failed", run_id=run_id, errors=cleanup_errors)
-                return {"errors": [*state.get("errors", []), *cleanup_errors],
-                        "status": "failed" if status == "success" else status}
-            self._event("resource_cleanup_completed", run_id=run_id,
-                        target_cleaned=self._cleanup_target)
-            return {}
 
         graph.add_node("target_preparation", self._stage("target_preparation", target_prepare))
         graph.add_node("document", self._stage("document", document))
@@ -256,25 +253,55 @@ class VulnForgeWorkflow:
         graph.add_node("planner", self._stage("planner", planner))
         graph.add_node("execution", self._stage("execution", execution))
         graph.add_node("evidence_verification", self._stage("evidence_verification", evidence_and_verify))
-        graph.add_node("resource_cleanup", cleanup)
         graph.add_edge(START, "target_preparation")
         graph.add_conditional_edges("target_preparation", lambda s: self._next(s, "document"))
         graph.add_conditional_edges("document", lambda s: self._next(s, "research"))
         graph.add_conditional_edges("research", lambda s: self._next(s, "planner"))
         graph.add_conditional_edges("planner", lambda s: self._next(s, "execution"))
         graph.add_conditional_edges("execution", lambda s: self._next(s, "evidence_verification"))
-        graph.add_edge("evidence_verification", "resource_cleanup")
-        graph.add_edge("resource_cleanup", END)
+        graph.add_edge("evidence_verification", END)
         return graph.compile()
 
-    def run(self, cve_id: str, *, authorization_callback=None, cleanup_target: bool = False,
+    def _cleanup_resources(self, run_id: str) -> list[str]:
+        errors = []
+        target_cleaned = False
+        try:
+            self.target_runtime.restore_metasploit(run_id=run_id)
+        except Exception as exc:
+            errors.append(f"Metasploit network restore: {type(exc).__name__}: {exc}")
+        try:
+            result = self.target_runtime.cleanup_target(run_id=run_id)
+            target_cleaned = isinstance(result, dict) and bool(result.get("cleaned"))
+        except Exception as exc:
+            errors.append(f"Vulhub target cleanup: {type(exc).__name__}: {exc}")
+        if errors:
+            self._event("resource_cleanup_failed", run_id=run_id, errors=errors)
+        else:
+            self._event("resource_cleanup_completed", run_id=run_id,
+                        target_cleaned=target_cleaned)
+        return errors
+
+    def run(self, cve_id: str, *, authorization_callback=None,
             verification_expectations=(), run_id: str | None = None) -> PipelineState:
         with self._run_lock:
-            self._cleanup_target = cleanup_target
             self._authorization_callback = authorization_callback
             self._verification_expectations = tuple(verification_expectations)
             initial: PipelineState = {"run_id": run_id or str(uuid.uuid4()),
                                       "cve_id": cve_id.upper(), "status": "running", "errors": []}
-            final = self.graph.invoke(initial)
+            final = initial
+            try:
+                final = self.graph.invoke(initial)
+            except KeyboardInterrupt:
+                final = {**initial, "status": "cancelled", "failed_stage": "user_cancelled",
+                         "errors": ["User interrupted"]}
+            except Exception as exc:
+                final = {**initial, "status": "failed", "failed_stage": "workflow",
+                         "errors": [f"{type(exc).__name__}: {exc}"]}
+            finally:
+                cleanup_errors = self._cleanup_resources(initial["run_id"])
+                if cleanup_errors:
+                    status = final.get("status", "failed")
+                    final = {**final, "errors": [*final.get("errors", []), *cleanup_errors],
+                             "status": "failed" if status == "success" else status}
             self._event("workflow_completed", run_id=final["run_id"], status=final.get("status", "failed"))
             return final
